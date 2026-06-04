@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from typing import Optional
 
 from PySide6.QtCore import QTimer, Qt
@@ -17,13 +18,13 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
-        QMessageBox,
-        QPushButton,
-        QStackedWidget,
-        QVBoxLayout,
-        QWidget,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
 from esp300 import (
@@ -36,19 +37,26 @@ from esp300 import (
     SERIAL_STOPBITS,
     SerialTransport,
     VisaTransport,
+    find_esp300_gpib_resources,
 )
 
 
 class OptionsDialog(QDialog):
-    def __init__(self, settings: ESP300Settings, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        settings: ESP300Settings,
+        max_jog_speed_mm_s: Optional[float],
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Options")
 
         self.jog_speed = QDoubleSpinBox()
-        self.jog_speed.setRange(0.001, 1000.0)
+        max_jog_speed = max_jog_speed_mm_s if max_jog_speed_mm_s else 1000.0
+        self.jog_speed.setRange(0.001, max_jog_speed)
         self.jog_speed.setDecimals(4)
         self.jog_speed.setSuffix(" mm/s")
-        self.jog_speed.setValue(settings.jog_speed_mm_s)
+        self.jog_speed.setValue(min(settings.jog_speed_mm_s, max_jog_speed))
 
         self.poll_interval = QDoubleSpinBox()
         self.poll_interval.setRange(0.05, 60.0)
@@ -67,6 +75,8 @@ class OptionsDialog(QDialog):
 
         form = QFormLayout()
         form.addRow("Jog speed", self.jog_speed)
+        if max_jog_speed_mm_s:
+            form.addRow("Controller max", QLabel(f"{max_jog_speed_mm_s:.6g} mm/s"))
         form.addRow("Poll interval", self.poll_interval)
         form.addRow("Flip X", self.flip_x)
         form.addRow("Flip Y", self.flip_y)
@@ -167,10 +177,12 @@ class MainWindow(QMainWindow):
         root_layout.setColumnStretch(0, 1)
         root_layout.setColumnStretch(1, 1)
         root_layout.setRowStretch(1, 1)
+        root_layout.setRowStretch(2, 1)
 
         root_layout.addWidget(self._build_connection_panel(), 0, 0)
         root_layout.addWidget(self._build_readout_panel(), 0, 1)
         root_layout.addWidget(self._build_joystick_panel(), 1, 0, 1, 2)
+        root_layout.addWidget(self._build_log_panel(), 2, 0, 1, 2)
 
         self.setCentralWidget(root)
         self.statusBar().showMessage("Disconnected")
@@ -188,6 +200,7 @@ class MainWindow(QMainWindow):
 
         self.port_combo = QComboBox()
         self.port_combo.setEditable(True)
+        self.port_combo.currentTextChanged.connect(self._refresh_connection_ui)
         self.refresh_ports_button = QPushButton("Refresh")
         self.refresh_ports_button.clicked.connect(self.refresh_serial_ports)
 
@@ -211,7 +224,10 @@ class MainWindow(QMainWindow):
         self.refresh_serial_ports()
 
         self.gpib_resource_combo = QComboBox()
-        self.gpib_resource_combo.setEditable(True)
+        self.gpib_resource_combo.setEditable(False)
+        self.gpib_resource_combo.currentIndexChanged.connect(
+            self._refresh_connection_ui
+        )
         self.refresh_gpib_button = QPushButton("Refresh")
         self.refresh_gpib_button.clicked.connect(self.refresh_gpib_resources)
 
@@ -261,13 +277,25 @@ class MainWindow(QMainWindow):
         self.poll_label = QLabel("Poll: 0.500 s")
         self.zero_button = QPushButton("Zero")
         self.zero_button.clicked.connect(self.zero_position)
+        self.x_motor_status = QLabel("--")
+        self.y_motor_status = QLabel("--")
+        self.x_limit_status = QLabel("--")
+        self.y_limit_status = QLabel("--")
 
         layout.addWidget(QLabel("X mm"), 0, 0)
         layout.addWidget(self.x_readout, 0, 1)
         layout.addWidget(QLabel("Y mm"), 1, 0)
         layout.addWidget(self.y_readout, 1, 1)
-        layout.addWidget(self.poll_label, 2, 0)
-        layout.addWidget(self.zero_button, 2, 1)
+        layout.addWidget(QLabel("X enabled"), 2, 0)
+        layout.addWidget(self.x_motor_status, 2, 1)
+        layout.addWidget(QLabel("Y enabled"), 3, 0)
+        layout.addWidget(self.y_motor_status, 3, 1)
+        layout.addWidget(QLabel("X end switches"), 4, 0)
+        layout.addWidget(self.x_limit_status, 4, 1)
+        layout.addWidget(QLabel("Y end switches"), 5, 0)
+        layout.addWidget(self.y_limit_status, 5, 1)
+        layout.addWidget(self.poll_label, 6, 0)
+        layout.addWidget(self.zero_button, 6, 1)
         return group
 
     def _build_joystick_panel(self) -> QGroupBox:
@@ -298,8 +326,35 @@ class MainWindow(QMainWindow):
         stop_row.addWidget(self.stop_button)
         stop_row.addWidget(self.abort_button)
 
+        motor_row = QHBoxLayout()
+        self.enable_motors_button = QPushButton("Enable all motors")
+        self.enable_motors_button.clicked.connect(self.enable_all_motors)
+        self.disable_motors_button = QPushButton("Disable all motors")
+        self.disable_motors_button.clicked.connect(self.disable_all_motors)
+        motor_row.addWidget(self.enable_motors_button)
+        motor_row.addWidget(self.disable_motors_button)
+
         outer.addLayout(grid)
         outer.addLayout(stop_row)
+        outer.addLayout(motor_row)
+        return group
+
+    def _build_log_panel(self) -> QGroupBox:
+        group = QGroupBox("Message Log")
+        layout = QVBoxLayout(group)
+
+        self.command_log = QPlainTextEdit()
+        self.command_log.setReadOnly(True)
+        self.command_log.setMaximumBlockCount(2000)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        clear_button = QPushButton("Clear")
+        clear_button.clicked.connect(self.command_log.clear)
+        button_row.addWidget(clear_button)
+
+        layout.addWidget(self.command_log)
+        layout.addLayout(button_row)
         return group
 
     def _make_jog_button(self, text: str) -> QPushButton:
@@ -314,6 +369,7 @@ class MainWindow(QMainWindow):
 
     def _on_method_changed(self, index: int) -> None:
         self.connection_stack.setCurrentIndex(index)
+        self._refresh_connection_ui()
 
     def toggle_connection(self) -> None:
         if self.controller and self.controller.is_connected:
@@ -328,17 +384,23 @@ class MainWindow(QMainWindow):
                 transport = SerialTransport(
                     self.port_combo.currentText().strip(),
                     rtscts=self.rtscts_check.isChecked(),
+                    log_callback=self.append_log,
                 )
             else:
-                transport = VisaTransport(self.gpib_resource_combo.currentText().strip())
+                resource_name = self.selected_gpib_resource_name()
+                if resource_name is None:
+                    raise ESP300Error("No ESP300/ESP301 GPIB resource is selected")
+                transport = VisaTransport(resource_name, log_callback=self.append_log)
 
             controller = ESP300Controller(transport)
             controller.connect()
             self.controller = controller
+            self.apply_controller_limits()
             self.statusBar().showMessage(f"Connected via {method}")
             self.poll_position()
         except Exception as exc:
             self.controller = None
+            self.reset_axis_statuses()
             QMessageBox.critical(self, "Connection failed", str(exc))
         self._refresh_connection_ui()
 
@@ -353,12 +415,17 @@ class MainWindow(QMainWindow):
         self.controller = None
         self.pressed_directions.clear()
         self.active_physical_dirs = {1: 0, 2: 0}
+        self.reset_axis_statuses()
         self.statusBar().showMessage("Disconnected")
         self._refresh_connection_ui()
 
-    def _refresh_connection_ui(self) -> None:
+    def _refresh_connection_ui(self, *_args) -> None:
+        if not hasattr(self, "connect_button"):
+            return
         connected = bool(self.controller and self.controller.is_connected)
+        can_connect = connected or self.connection_selection_available()
         self.connect_button.setText("Disconnect" if connected else "Connect")
+        self.connect_button.setEnabled(can_connect)
         self.connection_status.setText("Connected" if connected else "Not connected")
         self.method_combo.setEnabled(not connected)
         self.port_combo.setEnabled(not connected)
@@ -388,34 +455,61 @@ class MainWindow(QMainWindow):
         index = self.port_combo.findText(current)
         self.port_combo.setCurrentIndex(index if index >= 0 else 0)
         self.port_combo.blockSignals(False)
+        self._refresh_connection_ui()
 
     def refresh_gpib_resources(self) -> None:
-        current = self.gpib_resource_combo.currentText().strip() or "GPIB0::1::INSTR"
-        resources = []
+        current = self.selected_gpib_resource_name()
         try:
-            import pyvisa
-
-            resource_manager = pyvisa.ResourceManager()
-            resources = [
-                name
-                for name in resource_manager.list_resources()
-                if "GPIB" in name.upper()
-            ]
-            resource_manager.close()
-        except Exception:
+            resources = find_esp300_gpib_resources()
+        except Exception as exc:
             resources = []
-
-        if current and current not in resources:
-            resources.insert(0, current)
-        if not resources:
-            resources = ["GPIB0::1::INSTR"]
+            self.statusBar().showMessage(f"GPIB refresh failed: {exc}")
 
         self.gpib_resource_combo.blockSignals(True)
         self.gpib_resource_combo.clear()
-        self.gpib_resource_combo.addItems(resources)
-        index = self.gpib_resource_combo.findText(current)
-        self.gpib_resource_combo.setCurrentIndex(index if index >= 0 else 0)
+        if resources:
+            for resource in resources:
+                self.gpib_resource_combo.addItem(
+                    f"{resource.resource_name} - {resource.identity}",
+                    resource.resource_name,
+                )
+            if current:
+                for index in range(self.gpib_resource_combo.count()):
+                    if self.gpib_resource_combo.itemData(index) == current:
+                        self.gpib_resource_combo.setCurrentIndex(index)
+                        break
+        else:
+            self.gpib_resource_combo.addItem("None", None)
         self.gpib_resource_combo.blockSignals(False)
+        if resources:
+            self.statusBar().showMessage(
+                f"Found {len(resources)} ESP300/ESP301 GPIB resource(s)"
+            )
+        else:
+            self.statusBar().showMessage("No ESP300/ESP301 GPIB resources found")
+        self._refresh_connection_ui()
+
+    def selected_gpib_resource_name(self) -> Optional[str]:
+        resource_name = self.gpib_resource_combo.currentData()
+        if isinstance(resource_name, str) and resource_name:
+            return resource_name
+        return None
+
+    def connection_selection_available(self) -> bool:
+        if self.method_combo.currentText() == "RS232":
+            return bool(self.port_combo.currentText().strip())
+        return self.selected_gpib_resource_name() is not None
+
+    def current_max_jog_speed_mm_s(self) -> Optional[float]:
+        if not self.controller or not self.controller.is_connected:
+            return None
+        max_speed = self.controller.max_jog_speed_mm_s
+        return max_speed if max_speed > 0 else None
+
+    def apply_controller_limits(self) -> None:
+        max_speed = self.current_max_jog_speed_mm_s()
+        if max_speed and self.settings.jog_speed_mm_s > max_speed:
+            self.settings.jog_speed_mm_s = max_speed
 
     def _set_direction_pressed(self, axis: str, direction: int, pressed: bool) -> None:
         item = (axis, direction)
@@ -487,16 +581,76 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 QMessageBox.warning(self, "Abort failed", str(exc))
 
+    def enable_all_motors(self) -> None:
+        if not self.controller or not self.controller.is_connected:
+            QMessageBox.information(self, "Not connected", "Connect to the ESP300 first.")
+            return
+        try:
+            self.controller.enable_all_motors()
+            self.poll_position()
+            self.statusBar().showMessage("All motors enabled")
+        except Exception as exc:
+            QMessageBox.warning(self, "Enable motors failed", str(exc))
+
+    def disable_all_motors(self) -> None:
+        if not self.controller or not self.controller.is_connected:
+            QMessageBox.information(self, "Not connected", "Connect to the ESP300 first.")
+            return
+        try:
+            self.pressed_directions.clear()
+            self.active_physical_dirs = {1: 0, 2: 0}
+            self.controller.disable_all_motors()
+            self.poll_position()
+            self.statusBar().showMessage("All motors disabled")
+        except Exception as exc:
+            QMessageBox.warning(self, "Disable motors failed", str(exc))
+
     def poll_position(self) -> None:
         if not self.controller or not self.controller.is_connected:
             return
         try:
-            self.current_position = self.controller.read_position_mm()
+            snapshot = self.controller.read_snapshot()
+            self.current_position = (snapshot.x_mm, snapshot.y_mm)
             self.x_readout.setText(f"{self.current_position[0]:.6f}")
             self.y_readout.setText(f"{self.current_position[1]:.6f}")
+            self.update_axis_statuses(snapshot.axis_states)
             self.statusBar().showMessage("Position updated")
         except Exception as exc:
             self.statusBar().showMessage(f"Position poll failed: {exc}")
+
+    def update_axis_statuses(self, axis_states) -> None:
+        x_state = axis_states.get(1)
+        y_state = axis_states.get(2)
+        self.x_motor_status.setText(self.format_motor_status(x_state))
+        self.y_motor_status.setText(self.format_motor_status(y_state))
+        self.x_limit_status.setText(self.format_limit_status(x_state))
+        self.y_limit_status.setText(self.format_limit_status(y_state))
+
+    def reset_axis_statuses(self) -> None:
+        if not hasattr(self, "x_motor_status"):
+            return
+        self.x_motor_status.setText("--")
+        self.y_motor_status.setText("--")
+        self.x_limit_status.setText("--")
+        self.y_limit_status.setText("--")
+
+    def format_motor_status(self, state) -> str:
+        if state is None:
+            return "--"
+        return "On" if state.motor_enabled else "Off"
+
+    def format_limit_status(self, state) -> str:
+        if state is None:
+            return "--"
+        neg = "High" if state.negative_limit_high else "Low"
+        pos = "High" if state.positive_limit_high else "Low"
+        return f"- {neg} / + {pos}"
+
+    def append_log(self, message: str) -> None:
+        if not hasattr(self, "command_log"):
+            return
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        self.command_log.appendPlainText(f"{timestamp}  {message}")
 
     def zero_position(self) -> None:
         if not self.controller or not self.controller.is_connected:
@@ -512,11 +666,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Zero failed", str(exc))
 
     def show_options(self) -> None:
-        dialog = OptionsDialog(self.settings, self)
+        if self.controller and self.controller.is_connected:
+            try:
+                self.controller.refresh_max_velocities()
+                self.apply_controller_limits()
+            except Exception as exc:
+                self.statusBar().showMessage(f"Could not refresh max velocity: {exc}")
+        max_speed = self.current_max_jog_speed_mm_s()
+        dialog = OptionsDialog(self.settings, max_speed, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.stop_all()
         dialog.update_settings(self.settings)
+        self.apply_controller_limits()
         self.poll_timer.setInterval(int(self.settings.poll_interval_s * 1000))
         self.poll_label.setText(f"Poll: {self.settings.poll_interval_s:.3f} s")
         self.statusBar().showMessage("Options updated")

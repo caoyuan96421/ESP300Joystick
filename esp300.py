@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 
 SERIAL_BAUDRATE = 19200
@@ -13,6 +13,8 @@ SERIAL_READ_TERMINATOR = "\r\n"
 
 GPIB_WRITE_TERMINATOR = "\r"
 GPIB_READ_TERMINATOR = "\n"
+
+CommandLogger = Callable[[str], None]
 
 
 class ESP300Error(RuntimeError):
@@ -47,10 +49,12 @@ class SerialTransport:
         port: str,
         timeout_s: float = 1.0,
         rtscts: bool = True,
+        log_callback: Optional[CommandLogger] = None,
     ) -> None:
         self.port = port
         self.timeout_s = timeout_s
         self.rtscts = rtscts
+        self.log_callback = log_callback
         self._serial = None
 
     @property
@@ -81,6 +85,7 @@ class SerialTransport:
     def write(self, command: str) -> None:
         if not self._serial or not self._serial.is_open:
             raise ESP300Error("Serial connection is not open")
+        self._log(f">> {_strip_command(command)}")
         payload = _command_payload(command)
         self._serial.write(payload.encode("ascii"))
         self._serial.flush()
@@ -92,14 +97,27 @@ class SerialTransport:
         self.write(command)
         response = self._serial.readline().decode("ascii", errors="replace")
         if response == "":
+            self._log(f"!! timeout waiting for {_strip_command(command)}")
             raise ESP300Error(f"Timed out waiting for response to {command!r}")
-        return response.strip()
+        response = response.strip()
+        self._log(f"<< {response}")
+        return response
+
+    def _log(self, message: str) -> None:
+        if self.log_callback:
+            self.log_callback(message)
 
 
 class VisaTransport:
-    def __init__(self, resource_name: str, timeout_s: float = 1.0) -> None:
+    def __init__(
+        self,
+        resource_name: str,
+        timeout_s: float = 1.0,
+        log_callback: Optional[CommandLogger] = None,
+    ) -> None:
         self.resource_name = resource_name
         self.timeout_s = timeout_s
+        self.log_callback = log_callback
         self._resource_manager = None
         self._resource = None
 
@@ -130,12 +148,42 @@ class VisaTransport:
     def write(self, command: str) -> None:
         if not self._resource:
             raise ESP300Error("VISA connection is not open")
-        self._resource.write(_strip_command(command))
+        command = _strip_command(command)
+        self._log(f">> {command}")
+        self._resource.write(command)
 
     def query(self, command: str) -> str:
         if not self._resource:
             raise ESP300Error("VISA connection is not open")
-        return str(self._resource.query(_strip_command(command))).strip()
+        command = _strip_command(command)
+        self._log(f">> {command}")
+        response = str(self._resource.query(command)).strip()
+        self._log(f"<< {response}")
+        return response
+
+    def _log(self, message: str) -> None:
+        if self.log_callback:
+            self.log_callback(message)
+
+
+@dataclass(frozen=True)
+class VisaResourceInfo:
+    resource_name: str
+    identity: str
+
+
+@dataclass(frozen=True)
+class AxisState:
+    motor_enabled: bool
+    negative_limit_high: bool
+    positive_limit_high: bool
+
+
+@dataclass(frozen=True)
+class ControllerSnapshot:
+    x_mm: float
+    y_mm: float
+    axis_states: dict[int, AxisState]
 
 
 @dataclass
@@ -194,6 +242,10 @@ class ESP300Controller:
             1: AxisScale(),
             2: AxisScale(),
         }
+        self.max_velocity_mm_s = {
+            1: 0.0,
+            2: 0.0,
+        }
 
     @property
     def is_connected(self) -> bool:
@@ -201,7 +253,12 @@ class ESP300Controller:
 
     def connect(self) -> None:
         self.transport.open()
-        self.refresh_axis_units()
+        try:
+            self.refresh_axis_units()
+            self.refresh_max_velocities()
+        except Exception:
+            self.transport.close()
+            raise
 
     def close(self) -> None:
         self.transport.close()
@@ -210,6 +267,20 @@ class ESP300Controller:
         for axis in (1, 2):
             raw = self.transport.query(f"{axis}SN?")
             self.axis_scales[axis].unit_code = int(float(raw))
+
+    def refresh_max_velocities(self) -> None:
+        for axis in (1, 2):
+            raw = self.transport.query(f"{axis}VU?")
+            self.max_velocity_mm_s[axis] = self.axis_scales[
+                axis
+            ].mm_from_controller_units(float(raw))
+
+    @property
+    def max_jog_speed_mm_s(self) -> float:
+        values = [value for value in self.max_velocity_mm_s.values() if value > 0]
+        if not values:
+            return 0.0
+        return min(values)
 
     def read_position_mm(self) -> tuple[float, float]:
         x = self.axis_scales[1].mm_from_controller_units(
@@ -220,8 +291,46 @@ class ESP300Controller:
         )
         return x, y
 
+    def read_snapshot(self) -> ControllerSnapshot:
+        x, y = self.read_position_mm()
+        return ControllerSnapshot(
+            x_mm=x,
+            y_mm=y,
+            axis_states=self.read_axis_states(),
+        )
+
+    def read_axis_states(self) -> dict[int, AxisState]:
+        hardware_registers = self.read_hardware_status_registers()
+        register_1 = hardware_registers[0] if hardware_registers else 0
+        states = {}
+        for axis in (1, 2):
+            motor_enabled = bool(int(float(self.transport.query(f"{axis}MO?"))))
+            positive_bit = axis - 1
+            negative_bit = axis + 7
+            states[axis] = AxisState(
+                motor_enabled=motor_enabled,
+                negative_limit_high=bool(register_1 & (1 << negative_bit)),
+                positive_limit_high=bool(register_1 & (1 << positive_bit)),
+            )
+        return states
+
+    def read_hardware_status_registers(self) -> list[int]:
+        response = self.transport.query("PH")
+        registers = []
+        for token in response.split(","):
+            token = token.strip().rstrip("Hh")
+            if token:
+                registers.append(int(token, 16))
+        return registers
+
     def zero_xy(self) -> None:
         self.transport.write("1DH0;2DH0")
+
+    def enable_all_motors(self) -> None:
+        self.transport.write("1MO;2MO")
+
+    def disable_all_motors(self) -> None:
+        self.transport.write("1MF;2MF")
 
     def jog_axis(self, axis: int, direction: int, speed_mm_s: float) -> None:
         if direction == 0:
@@ -229,6 +338,12 @@ class ESP300Controller:
             return
         if axis not in (1, 2):
             raise ESP300Error(f"Unsupported axis {axis}")
+        max_speed = self.max_velocity_mm_s.get(axis, 0.0)
+        if max_speed > 0 and speed_mm_s > max_speed:
+            raise ESP300Error(
+                f"Requested jog speed {speed_mm_s:g} mm/s exceeds axis {axis} "
+                f"maximum {max_speed:g} mm/s"
+            )
         speed = abs(self.axis_scales[axis].controller_units_from_mm(speed_mm_s))
         sign = "+" if direction > 0 else "-"
         self.transport.write(f"{axis}VA{_fmt(speed)};{axis}MV{sign}")
@@ -284,3 +399,54 @@ def _command_payload(command: str) -> str:
 
 def _fmt(value: float) -> str:
     return f"{value:.9g}"
+
+
+def find_esp300_gpib_resources(timeout_s: float = 0.5) -> list[VisaResourceInfo]:
+    try:
+        import pyvisa
+    except ImportError as exc:
+        raise ESP300Error("pyvisa is required to scan GPIB resources") from exc
+
+    resource_manager = pyvisa.ResourceManager()
+    matches: list[VisaResourceInfo] = []
+    try:
+        resource_names = [
+            name
+            for name in resource_manager.list_resources()
+            if "GPIB" in name.upper()
+        ]
+        for resource_name in resource_names:
+            identity = _probe_esp300_resource(
+                resource_manager, resource_name, timeout_s
+            )
+            if identity:
+                matches.append(VisaResourceInfo(resource_name, identity))
+    finally:
+        resource_manager.close()
+    return matches
+
+
+def _probe_esp300_resource(resource_manager, resource_name: str, timeout_s: float) -> str:
+    resource = None
+    try:
+        resource = resource_manager.open_resource(resource_name)
+        resource.timeout = int(timeout_s * 1000)
+        resource.write_termination = GPIB_WRITE_TERMINATOR
+        resource.read_termination = GPIB_READ_TERMINATOR
+        identity = str(resource.query("VE?")).strip()
+        identity_upper = identity.upper()
+        if (
+            "ESP300" in identity_upper
+            or "ESP301" in identity_upper
+            or "ESP0300" in identity_upper
+        ):
+            return identity
+    except Exception:
+        return ""
+    finally:
+        if resource is not None:
+            try:
+                resource.close()
+            except Exception:
+                pass
+    return ""

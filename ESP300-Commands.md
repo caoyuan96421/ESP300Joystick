@@ -132,7 +132,9 @@ future configuration deliberately maps them to linear travel.
 At startup, query and cache:
 
 ```text
+VE?
 1SN?;2SN?
+1VU?;2VU?
 1SU?;2SU?
 1FR?;2FR?
 1TP;2TP
@@ -142,6 +144,14 @@ PH
 If both axes are configured as millimeters, commands can be sent directly in mm.
 If not, convert all positions, velocities, acceleration, and deceleration through
 the per-axis scale.
+
+`VE?` reads the controller type and firmware version. It is useful for GPIB
+discovery because ESP300 returns text beginning with `ESP300 Version ...`; ESP301
+uses the same command family.
+
+`VU?` reads the per-axis maximum velocity in configured/predefined units per
+second. Use `1VU?` and `2VU?`, convert both to mm/s, and cap the joystick jog
+speed to the lower of the two values.
 
 For coordinated group motion, prefer both axes to have the same physical unit
 scale. If X and Y are in different controller units, `HL` targets can still be
@@ -235,6 +245,34 @@ For register 1:
 The bit value reports whether the signal is low or high. Whether high means
 "limit reached" depends on the limit switch wiring and controller
 configuration, so this should be verified on hardware.
+
+### Read And Set Motor Power
+
+Per-axis motor power status:
+
+```text
+1MO?
+2MO?
+```
+
+Returns:
+
+| Value | Meaning |
+| --- | --- |
+| `0` | motor power is off |
+| `1` | motor power is on |
+
+Enable both joystick axes:
+
+```text
+1MO;2MO
+```
+
+Disable both joystick axes:
+
+```text
+1MF;2MF
+```
 
 ### Start Jog Motion At A Given Velocity
 
