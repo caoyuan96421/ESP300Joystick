@@ -230,6 +230,10 @@ class AxisScale:
 class ESP300Settings:
     jog_speed_mm_s: float = 1.0
     poll_interval_s: float = 0.5
+    joystick_poll_interval_s: float = 0.1
+    low_deadband_percent: float = 5.0
+    high_deadband_percent: float = 10.0
+    joystick_exponent: float = 5.0
     rs232_rtscts: bool = True
     flip_x: bool = False
     flip_y: bool = False
