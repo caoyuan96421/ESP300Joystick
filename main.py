@@ -277,25 +277,20 @@ class MainWindow(QMainWindow):
         self.poll_label = QLabel("Poll: 0.500 s")
         self.zero_button = QPushButton("Zero")
         self.zero_button.clicked.connect(self.zero_position)
-        self.x_motor_status = QLabel("--")
-        self.y_motor_status = QLabel("--")
-        self.x_limit_status = QLabel("--")
-        self.y_limit_status = QLabel("--")
+        self.motor_status = QLabel("--")
+        self.limit_status = QLabel("--")
 
         layout.addWidget(QLabel("X mm"), 0, 0)
         layout.addWidget(self.x_readout, 0, 1)
         layout.addWidget(QLabel("Y mm"), 1, 0)
         layout.addWidget(self.y_readout, 1, 1)
-        layout.addWidget(QLabel("X enabled"), 2, 0)
-        layout.addWidget(self.x_motor_status, 2, 1)
-        layout.addWidget(QLabel("Y enabled"), 3, 0)
-        layout.addWidget(self.y_motor_status, 3, 1)
-        layout.addWidget(QLabel("X end switches"), 4, 0)
-        layout.addWidget(self.x_limit_status, 4, 1)
-        layout.addWidget(QLabel("Y end switches"), 5, 0)
-        layout.addWidget(self.y_limit_status, 5, 1)
-        layout.addWidget(self.poll_label, 6, 0)
-        layout.addWidget(self.zero_button, 6, 1)
+        layout.addWidget(self.zero_button, 0, 2, 2, 1)
+        layout.addWidget(QLabel("Motors"), 2, 0)
+        layout.addWidget(self.motor_status, 2, 1, 1, 2)
+        layout.addWidget(QLabel("End switches"), 3, 0)
+        layout.addWidget(self.limit_status, 3, 1, 1, 2)
+        layout.addWidget(self.poll_label, 4, 0)
+        layout.setColumnStretch(1, 1)
         return group
 
     def _build_joystick_panel(self) -> QGroupBox:
@@ -621,18 +616,20 @@ class MainWindow(QMainWindow):
     def update_axis_statuses(self, axis_states) -> None:
         x_state = axis_states.get(1)
         y_state = axis_states.get(2)
-        self.x_motor_status.setText(self.format_motor_status(x_state))
-        self.y_motor_status.setText(self.format_motor_status(y_state))
-        self.x_limit_status.setText(self.format_limit_status(x_state))
-        self.y_limit_status.setText(self.format_limit_status(y_state))
+        self.motor_status.setText(
+            f"X {self.format_motor_status(x_state)} | "
+            f"Y {self.format_motor_status(y_state)}"
+        )
+        self.limit_status.setText(
+            f"X {self.format_limit_status(x_state)} | "
+            f"Y {self.format_limit_status(y_state)}"
+        )
 
     def reset_axis_statuses(self) -> None:
-        if not hasattr(self, "x_motor_status"):
+        if not hasattr(self, "motor_status"):
             return
-        self.x_motor_status.setText("--")
-        self.y_motor_status.setText("--")
-        self.x_limit_status.setText("--")
-        self.y_limit_status.setText("--")
+        self.motor_status.setText("--")
+        self.limit_status.setText("--")
 
     def format_motor_status(self, state) -> str:
         if state is None:
@@ -644,7 +641,7 @@ class MainWindow(QMainWindow):
             return "--"
         neg = "High" if state.negative_limit_high else "Low"
         pos = "High" if state.positive_limit_high else "Low"
-        return f"- {neg} / + {pos}"
+        return f"-{neg} +{pos}"
 
     def append_log(self, message: str) -> None:
         if not hasattr(self, "command_log"):
