@@ -230,6 +230,7 @@ class AxisScale:
 class ESP300Settings:
     jog_speed_mm_s: float = 1.0
     poll_interval_s: float = 0.5
+    rs232_rtscts: bool = True
     flip_x: bool = False
     flip_y: bool = False
     swap_xy: bool = False
