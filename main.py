@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import queue
 import sys
+import threading
 import time
 from dataclasses import asdict, fields
 from datetime import datetime
@@ -280,6 +281,100 @@ class ESPWorkerThread(QThread):
         self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
 
 
+class JoystickPollingThread(QThread):
+    connection_changed = Signal(bool, str)
+    motion_changed = Signal(float, float)
+
+    def __init__(
+        self,
+        manager: HIDJoystickManager,
+        settings: ESP300Settings,
+    ) -> None:
+        super().__init__()
+        self._manager = manager
+        self._running = True
+        self._settings_lock = threading.Lock()
+        self._settings = asdict(settings)
+        self._last_motion = (0.0, 0.0)
+        self._last_connected: Optional[bool] = None
+
+    def update_settings(self, settings: ESP300Settings) -> None:
+        with self._settings_lock:
+            self._settings = asdict(settings)
+
+    def run(self) -> None:
+        next_detection = 0.0
+        while self._running:
+            now = time.monotonic()
+            if now >= next_detection:
+                connected, error = self._manager.refresh_connection()
+                self._emit_connection_if_changed(connected, error)
+                next_detection = now + 1.0
+
+            interval_s = self._setting("joystick_poll_interval_s", 0.1)
+            if not self._manager.connected:
+                self._emit_motion_if_changed((0.0, 0.0))
+                self.msleep(max(10, int(interval_s * 1000)))
+                continue
+
+            report = self._manager.read_latest()
+            if report is not None:
+                self._emit_motion_if_changed(self._map_report(report))
+            self.msleep(max(10, int(interval_s * 1000)))
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _map_report(self, report) -> tuple[float, float]:
+        x = self._map_axis(report.x_raw)
+        y = self._map_axis(report.y_raw)
+        if self._setting("swap_xy", False):
+            x, y = y, x
+        if self._setting("flip_x", False):
+            x = -x
+        if self._setting("flip_y", False):
+            y = -y
+        return round(x, 4), round(y, 4)
+
+    def _map_axis(self, raw: int) -> float:
+        centered = max(-1.0, min(1.0, (float(raw) - 512.0) / 512.0))
+        sign = 1.0 if centered >= 0 else -1.0
+        magnitude = abs(centered)
+        low = max(0.0, min(0.95, self._setting("low_deadband_percent", 5.0) / 100.0))
+        high = max(
+            0.0, min(0.95, self._setting("high_deadband_percent", 10.0) / 100.0)
+        )
+        active_span = max(0.001, 1.0 - low - high)
+        if magnitude <= low:
+            return 0.0
+        if magnitude >= 1.0 - high:
+            return sign
+        scaled = (magnitude - low) / active_span
+        return sign * (scaled ** max(1.0, self._setting("joystick_exponent", 5.0)))
+
+    def _emit_motion_if_changed(self, motion: tuple[float, float]) -> None:
+        if (
+            abs(motion[0] - self._last_motion[0]) > 1e-4
+            or abs(motion[1] - self._last_motion[1]) > 1e-4
+        ):
+            self._last_motion = motion
+            self.motion_changed.emit(*motion)
+
+    def _emit_connection_if_changed(self, connected: bool, error: str) -> None:
+        if connected == self._last_connected:
+            return
+        if connected:
+            status = f"Connected ({JOYSTICK_VID:04X}:{JOYSTICK_PID:04X})"
+        else:
+            status = error or "Disconnected"
+        self.connection_changed.emit(connected, status)
+        self._last_connected = connected
+
+    def _setting(self, name: str, default):
+        with self._settings_lock:
+            return self._settings.get(name, default)
+
+
 class OptionsDialog(QDialog):
     def __init__(
         self,
@@ -429,10 +524,6 @@ class MainWindow(QMainWindow):
         self.max_jog_speed_mm_s = 0.0
         self.current_position = (0.0, 0.0)
         self.pressed_directions: set[tuple[str, int]] = set()
-        self.hid_motion = (0.0, 0.0)
-        self.last_sent_joystick_motion: Optional[tuple[float, float]] = None
-        self.last_joystick_detection_s = 0.0
-        self.joystick_connected: Optional[bool] = None
         self.all_motors_enabled: Optional[bool] = None
 
         self._build_menu()
@@ -452,9 +543,15 @@ class MainWindow(QMainWindow):
         self.esp_worker.set_poll_interval(self.settings.poll_interval_s)
 
         self.joystick_manager = HIDJoystickManager()
-        self.joystick_timer = QTimer(self)
-        self.joystick_timer.timeout.connect(self.poll_joystick)
-        self.joystick_timer.start(self.joystick_poll_interval_ms())
+        self.joystick_worker = JoystickPollingThread(
+            self.joystick_manager,
+            self.settings,
+        )
+        self.joystick_worker.connection_changed.connect(
+            self.on_joystick_connection_changed
+        )
+        self.joystick_worker.motion_changed.connect(self.esp_worker.jog_normalized)
+        self.joystick_worker.start()
 
     def load_config(self) -> dict:
         try:
@@ -772,7 +869,6 @@ class MainWindow(QMainWindow):
         self.esp_connected = connected
         if not connected:
             self.pressed_directions.clear()
-            self.last_sent_joystick_motion = None
             self.reset_axis_statuses()
         self.connection_status.setText("Connected" if connected else "Not connected")
         self.statusBar().showMessage(message)
@@ -798,17 +894,6 @@ class MainWindow(QMainWindow):
         self._refresh_connection_ui()
 
     def on_joystick_connection_changed(self, connected: bool, status: str) -> None:
-        self.joystick_status.setText(status)
-
-    def update_joystick_connection_status(self, connected: bool, error: str = "") -> None:
-        if connected == self.joystick_connected:
-            return
-        self.joystick_connected = connected
-        if connected:
-            status = f"Connected ({JOYSTICK_VID:04X}:{JOYSTICK_PID:04X})"
-        else:
-            status = error or "Disconnected"
-            self.hid_motion = (0.0, 0.0)
         self.joystick_status.setText(status)
 
     def _refresh_connection_ui(self, *_args) -> None:
@@ -907,76 +992,16 @@ class MainWindow(QMainWindow):
             self.pressed_directions.add(item)
         else:
             self.pressed_directions.discard(item)
-        self.poll_joystick()
-
-    def joystick_poll_interval_ms(self) -> int:
-        return max(10, int(self.settings.joystick_poll_interval_s * 1000))
-
-    def poll_joystick(self) -> None:
-        self.refresh_joystick_connection_if_due()
-        hid_motion = self.read_hid_motion()
-        emulated_motion = self.emulated_joystick_motion()
-        if abs(emulated_motion[0]) > 1e-9 or abs(emulated_motion[1]) > 1e-9:
-            motion = emulated_motion
-        else:
-            motion = hid_motion
-        self.apply_joystick_motion(*motion)
-
-    def refresh_joystick_connection_if_due(self) -> None:
-        now = time.monotonic()
-        if now - self.last_joystick_detection_s < 1.0:
-            return
-        self.last_joystick_detection_s = now
-        connected, error = self.joystick_manager.refresh_connection()
-        self.update_joystick_connection_status(connected, error)
-
-    def read_hid_motion(self) -> tuple[float, float]:
-        if not self.joystick_manager.connected:
-            self.hid_motion = (0.0, 0.0)
-            return self.hid_motion
-        report = self.joystick_manager.read_latest()
-        if report is not None:
-            self.hid_motion = self.map_hid_report(report)
-        if not self.joystick_manager.connected:
-            self.update_joystick_connection_status(
-                False, self.joystick_manager.last_error
-            )
-        return self.hid_motion
-
-    def map_hid_report(self, report) -> tuple[float, float]:
-        x = self.map_joystick_axis(report.x_raw)
-        y = self.map_joystick_axis(report.y_raw)
-        return self.transform_logical_motion(x, y)
-
-    def map_joystick_axis(self, raw: int) -> float:
-        centered = max(-1.0, min(1.0, (float(raw) - 512.0) / 512.0))
-        sign = 1.0 if centered >= 0 else -1.0
-        magnitude = abs(centered)
-        low = max(0.0, min(0.95, self.settings.low_deadband_percent / 100.0))
-        high = max(0.0, min(0.95, self.settings.high_deadband_percent / 100.0))
-        active_span = max(0.001, 1.0 - low - high)
-        if magnitude <= low:
-            return 0.0
-        if magnitude >= 1.0 - high:
-            return sign
-        scaled = (magnitude - low) / active_span
-        return sign * (scaled ** max(1.0, self.settings.joystick_exponent))
+        self.apply_emulated_joystick()
 
     def emulated_joystick_motion(self) -> tuple[float, float]:
         logical_x = self._logical_direction("x")
         logical_y = self._logical_direction("y")
         return self.transform_logical_motion(float(logical_x), float(logical_y))
 
-    def apply_joystick_motion(self, x_norm: float, y_norm: float) -> None:
-        motion = (round(x_norm, 4), round(y_norm, 4))
-        if not self.esp_connected:
-            self.last_sent_joystick_motion = None
-            return
-        if motion == self.last_sent_joystick_motion:
-            return
-        self.last_sent_joystick_motion = motion
-        speed = self.settings.jog_speed_mm_s
-        self.esp_worker.jog_velocity(motion[0] * speed, motion[1] * speed)
+    def apply_emulated_joystick(self) -> None:
+        x_norm, y_norm = self.emulated_joystick_motion()
+        self.esp_worker.jog_normalized(x_norm, y_norm)
 
     def transform_logical_motion(
         self,
@@ -1002,13 +1027,11 @@ class MainWindow(QMainWindow):
 
     def stop_all(self) -> None:
         self.pressed_directions.clear()
-        self.last_sent_joystick_motion = None
         self.esp_worker.stop_motion()
         self.statusBar().showMessage("Stop sent")
 
     def abort_motion(self) -> None:
         self.pressed_directions.clear()
-        self.last_sent_joystick_motion = None
         self.esp_worker.abort_motion()
         self.statusBar().showMessage("Abort sent")
 
@@ -1024,7 +1047,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Not connected", "Connect to the ESP300 first.")
             return
         self.pressed_directions.clear()
-        self.last_sent_joystick_motion = None
         self.esp_worker.disable_all_motors()
         self.statusBar().showMessage("Disable all motors sent")
 
@@ -1117,9 +1139,9 @@ class MainWindow(QMainWindow):
         dialog.update_settings(self.settings)
         self.apply_controller_limits()
         self.esp_worker.set_poll_interval(self.settings.poll_interval_s)
-        self.joystick_timer.setInterval(self.joystick_poll_interval_ms())
-        self.last_sent_joystick_motion = None
-        self.poll_joystick()
+        self.joystick_worker.update_settings(self.settings)
+        if self.pressed_directions:
+            self.apply_emulated_joystick()
         self.statusBar().showMessage("Options updated")
         self.save_config()
 
@@ -1137,14 +1159,24 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API name
         self.save_config()
-        if hasattr(self, "joystick_timer"):
-            self.joystick_timer.stop()
+        self.stop_workers()
+        event.accept()
+
+    def stop_workers(self) -> None:
+        if hasattr(self, "joystick_worker"):
+            self.joystick_worker.stop()
+            self.joystick_worker.wait(1500)
         if hasattr(self, "joystick_manager"):
             self.joystick_manager.close()
         if hasattr(self, "esp_worker"):
             self.esp_worker.stop()
             self.esp_worker.wait(2000)
-        event.accept()
+
+    def __del__(self) -> None:
+        try:
+            self.stop_workers()
+        except Exception:
+            pass
 
 
 def main() -> int:
