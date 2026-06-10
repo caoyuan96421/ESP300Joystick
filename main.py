@@ -47,7 +47,9 @@ from esp300 import (
 from joystick import HIDJoystickManager, PID as JOYSTICK_PID, VID as JOYSTICK_VID
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
+DEFAULT_JOYSTICK_POLL_INTERVAL_S = 0.1
+JOYSTICK_MOTION_EPSILON = 0.01
 
 
 class ESPWorkerThread(QThread):
@@ -64,6 +66,9 @@ class ESPWorkerThread(QThread):
         self._poll_interval_s = settings.poll_interval_s
         self._controller: Optional[ESP300Controller] = None
         self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
+        self._jog_lock = threading.Lock()
+        self._pending_jog_normalized: Optional[tuple[float, float]] = None
+        self._jog_update_queued = False
 
     def run(self) -> None:
         next_poll = time.monotonic()
@@ -81,8 +86,11 @@ class ESPWorkerThread(QThread):
                 and self._controller.is_connected
                 and time.monotonic() >= next_poll
                 and self._commands.empty()
+                and not self._motion_active()
             ):
-                self._poll_snapshot()
+                self._safe_poll_snapshot()
+                next_poll = time.monotonic() + self._poll_interval_s
+            elif self._motion_active():
                 next_poll = time.monotonic() + self._poll_interval_s
 
         self._close_controller()
@@ -118,7 +126,12 @@ class ESPWorkerThread(QThread):
         self._commands.put(("jog_velocity", x_mm_s, y_mm_s))
 
     def jog_normalized(self, x_norm: float, y_norm: float) -> None:
-        self._commands.put(("jog_normalized", x_norm, y_norm))
+        with self._jog_lock:
+            self._pending_jog_normalized = (float(x_norm), float(y_norm))
+            if self._jog_update_queued:
+                return
+            self._jog_update_queued = True
+        self._commands.put(("jog_update",))
 
     def stop_motion(self) -> None:
         self._commands.put(("stop",))
@@ -157,6 +170,10 @@ class ESPWorkerThread(QThread):
             elif name == "jog_velocity":
                 if self._controller and self._controller.is_connected:
                     self._apply_velocity(command[1], command[2])
+            elif name == "jog_update":
+                motion = self._take_pending_jog_normalized()
+                if motion and self._controller and self._controller.is_connected:
+                    self._apply_normalized_velocity(*motion)
             elif name == "jog_normalized":
                 if self._controller and self._controller.is_connected:
                     self._apply_normalized_velocity(command[1], command[2])
@@ -229,6 +246,22 @@ class ESPWorkerThread(QThread):
             return
         snapshot = self._controller.read_snapshot()
         self.snapshot_ready.emit(snapshot)
+
+    def _safe_poll_snapshot(self) -> None:
+        try:
+            self._poll_snapshot()
+        except Exception as exc:
+            self.error_message.emit(f"Position poll failed: {exc}")
+
+    def _motion_active(self) -> bool:
+        return any(abs(value) > 1e-9 for value in self._active_velocity_mm_s.values())
+
+    def _take_pending_jog_normalized(self) -> Optional[tuple[float, float]]:
+        with self._jog_lock:
+            motion = self._pending_jog_normalized
+            self._pending_jog_normalized = None
+            self._jog_update_queued = False
+            return motion
 
     def _refresh_max_velocity(self) -> None:
         controller = self._require_controller()
@@ -357,9 +390,11 @@ class JoystickPollingThread(QThread):
         return sign * (scaled ** max(1.0, self._setting("joystick_exponent", 5.0)))
 
     def _emit_motion_if_changed(self, motion: tuple[float, float]) -> None:
+        epsilon = JOYSTICK_MOTION_EPSILON
         if (
-            abs(motion[0] - self._last_motion[0]) > 1e-4
-            or abs(motion[1] - self._last_motion[1]) > 1e-4
+            abs(motion[0] - self._last_motion[0]) >= epsilon
+            or abs(motion[1] - self._last_motion[1]) >= epsilon
+            or (motion == (0.0, 0.0) and self._last_motion != (0.0, 0.0))
         ):
             self._last_motion = motion
             self.motion_changed.emit(*motion)
@@ -576,6 +611,9 @@ class MainWindow(QMainWindow):
         )
         self.joystick_worker.motion_changed.connect(self.esp_worker.jog_normalized)
         self.joystick_worker.report_message.connect(self.append_log)
+        self.append_log(
+            f"Joystick poll interval: {self.settings.joystick_poll_interval_s:.3f} s"
+        )
         self.joystick_worker.start()
 
     def load_config(self) -> dict:
@@ -612,6 +650,11 @@ class MainWindow(QMainWindow):
                     setattr(settings, name, bool(value))
             except (TypeError, ValueError):
                 continue
+        if self.config.get("version", 0) < 2:
+            settings.joystick_poll_interval_s = min(
+                settings.joystick_poll_interval_s,
+                DEFAULT_JOYSTICK_POLL_INTERVAL_S,
+            )
         return settings
 
     def save_config(self) -> None:
