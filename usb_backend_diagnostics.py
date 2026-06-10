@@ -20,7 +20,7 @@ def report(label: str, func) -> None:
     try:
         result = func()
     except Exception:
-        traceback.print_exc()
+        print(traceback.format_exc().rstrip())
     else:
         if result is not None:
             print(result)

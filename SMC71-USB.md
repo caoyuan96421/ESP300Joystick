@@ -36,6 +36,11 @@ device.read(0x81, 10, 1)
 Each input report is read as a 10-byte packet. The first 7 bytes are decoded by
 the old script. Bytes 7 through 9 are read but unused.
 
+When reading through `hidapi` on Windows, the same device may return an 8-byte
+report instead of the 10-byte PyUSB interrupt packet. This is acceptable as long
+as the first 7 decoded bytes are present. The current parser accepts shorter
+reports and auto-detects whether byte `0` is an HID report ID or the X low byte.
+
 | Byte offset | Field | Decode | Notes |
 | --- | --- | --- | --- |
 | `0` | X low byte | `x_raw = data[0] \| (data[1] << 8)` | Little-endian unsigned value |

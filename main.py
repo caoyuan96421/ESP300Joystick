@@ -284,6 +284,7 @@ class ESPWorkerThread(QThread):
 class JoystickPollingThread(QThread):
     connection_changed = Signal(bool, str)
     motion_changed = Signal(float, float)
+    report_message = Signal(str)
 
     def __init__(
         self,
@@ -298,6 +299,7 @@ class JoystickPollingThread(QThread):
         self._last_motion = (0.0, 0.0)
         self._last_connected: Optional[bool] = None
         self._last_status = ""
+        self._report_logs_remaining = 3
 
     def update_settings(self, settings: ESP300Settings) -> None:
         with self._settings_lock:
@@ -320,6 +322,7 @@ class JoystickPollingThread(QThread):
 
             report = self._manager.read_latest()
             if report is not None:
+                self._emit_report_debug(report)
                 self._emit_motion_if_changed(self._map_report(report))
             self.msleep(max(10, int(interval_s * 1000)))
 
@@ -378,6 +381,18 @@ class JoystickPollingThread(QThread):
         self.connection_changed.emit(connected, status)
         self._last_connected = connected
         self._last_status = status
+
+    def _emit_report_debug(self, report) -> None:
+        if self._report_logs_remaining <= 0:
+            return
+        raw = " ".join(f"{byte:02X}" for byte in report.raw)
+        self.report_message.emit(
+            "JOYSTICK REPORT: "
+            f"len={len(report.raw)} offset={report.data_offset} raw={raw} "
+            f"axes=({report.x_raw},{report.y_raw},{report.z_raw}) "
+            f"buttons=0x{report.button_byte:02X}"
+        )
+        self._report_logs_remaining -= 1
 
     def _setting(self, name: str, default):
         with self._settings_lock:
@@ -560,6 +575,7 @@ class MainWindow(QMainWindow):
             self.on_joystick_connection_changed
         )
         self.joystick_worker.motion_changed.connect(self.esp_worker.jog_normalized)
+        self.joystick_worker.report_message.connect(self.append_log)
         self.joystick_worker.start()
 
     def load_config(self) -> dict:

@@ -14,7 +14,7 @@ REPORT_LEN = 10
 READ_TIMEOUT_MS = 1
 BACKEND_INSTALL_HINT = (
     "Install on the machine running the app: "
-    f"{sys.executable} -m pip install pyusb libusb-package"
+    f"{sys.executable} -m pip install pyusb libusb-package hidapi"
 )
 
 
@@ -25,6 +25,8 @@ class JoystickReport:
     z_raw: int
     button_byte: int
     tail: bytes
+    raw: bytes = b""
+    data_offset: int = 0
 
 
 class HIDJoystickManager:
@@ -134,7 +136,7 @@ class HIDJoystickManager:
                     "PyUSB/libusb backend package is not importable in this "
                     f"Python environment: {import_exc}. Run "
                     f"`{sys.executable} -m pip install --upgrade pyusb "
-                    "libusb-package` "
+                    "libusb-package hidapi` "
                     "with the same Python used to start this app."
                 ) from import_exc
 
@@ -197,7 +199,11 @@ class HIDJoystickManager:
 
         if data is None:
             return None
-        return parse_report(data)
+        try:
+            return parse_report(data)
+        except Exception as exc:
+            self._set_disconnected_locked(f"Joystick report parse failed: {exc}")
+            return None
 
     def _read_latest_hidapi_locked(self) -> Optional[JoystickReport]:
         data = None
@@ -213,7 +219,11 @@ class HIDJoystickManager:
 
         if data is None:
             return None
-        return parse_report(data)
+        try:
+            return parse_report(data)
+        except Exception as exc:
+            self._set_disconnected_locked(f"Joystick report parse failed: {exc}")
+            return None
 
     def close(self) -> None:
         with self._lock:
@@ -255,15 +265,48 @@ class HIDJoystickManager:
 
 def parse_report(data) -> JoystickReport:
     data = list(data)
-    if len(data) == REPORT_LEN + 1:
-        data = data[1:]
-    if len(data) < REPORT_LEN:
-        raise ValueError(f"Expected {REPORT_LEN}-byte report, got {len(data)}")
-    data = data[:REPORT_LEN]
+    raw = bytes(data)
+    if len(data) < 7:
+        raise ValueError(f"Expected at least 7 report bytes, got {len(data)}")
+
+    offset = _choose_report_offset(data)
+    payload = data[offset:]
+    if len(payload) < 7:
+        raise ValueError(
+            f"Expected at least 7 payload bytes after offset {offset}, "
+            f"got {len(payload)}"
+        )
     return JoystickReport(
-        x_raw=data[0] | (data[1] << 8),
-        y_raw=data[2] | (data[3] << 8),
-        z_raw=data[4] | (data[5] << 8),
-        button_byte=data[6],
-        tail=bytes(data[7:10]),
+        x_raw=payload[0] | (payload[1] << 8),
+        y_raw=payload[2] | (payload[3] << 8),
+        z_raw=payload[4] | (payload[5] << 8),
+        button_byte=payload[6],
+        tail=bytes(payload[7:]),
+        raw=raw,
+        data_offset=offset,
     )
+
+
+def _choose_report_offset(data: list[int]) -> int:
+    candidates = [0]
+    if len(data) >= 8:
+        candidates.append(1)
+
+    def score(offset: int) -> int:
+        payload = data[offset:]
+        if len(payload) < 7:
+            return 1_000_000
+        axes = (
+            payload[0] | (payload[1] << 8),
+            payload[2] | (payload[3] << 8),
+            payload[4] | (payload[5] << 8),
+        )
+        penalty = 0
+        for value in axes:
+            if value > 0x03FF:
+                penalty += 100_000 + value
+            else:
+                penalty += abs(value - 512)
+        return penalty
+
+    return min(candidates, key=lambda candidate: (score(candidate), candidate))
