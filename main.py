@@ -51,12 +51,19 @@ CONFIG_VERSION = 2
 DEFAULT_JOYSTICK_POLL_INTERVAL_S = 0.1
 JOYSTICK_MOTION_EPSILON = 0.01
 BACKGROUND_POLL_TIMEOUT_S = 0.05
+GOTO_DONE_POLL_INTERVAL_S = 0.1
+GOTO_SYNC_TIMEOUT_S = 300.0
+JOYSTICK_STATUS_NO_LIBRARY = "No library connected"
+JOYSTICK_STATUS_NOT_FOUND = "No Joystick Found"
+JOYSTICK_STATUS_CANNOT_CONNECT = "Joystick found but cannot connect"
+JOYSTICK_STATUS_CONNECTED = "Joystick connected"
 
 
 class ESPWorkerThread(QThread):
     connected_changed = Signal(bool, str)
     snapshot_ready = Signal(object)
     max_jog_speed_changed = Signal(float)
+    goto_active_changed = Signal(bool)
     log_message = Signal(str)
     error_message = Signal(str)
 
@@ -68,8 +75,10 @@ class ESPWorkerThread(QThread):
         self._controller: Optional[ESP300Controller] = None
         self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
         self._jog_lock = threading.Lock()
-        self._pending_jog_normalized: Optional[tuple[float, float]] = None
+        self._pending_jog_normalized: Optional[tuple[int, float, float]] = None
         self._jog_update_queued = False
+        self._motion_generation = 0
+        self._goto_active = False
 
     def run(self) -> None:
         next_poll = time.monotonic()
@@ -112,6 +121,7 @@ class ESPWorkerThread(QThread):
         )
 
     def disconnect_controller(self) -> None:
+        self._invalidate_motion_generation(clear_pending=True)
         self._commands.put(("disconnect",))
 
     def set_poll_interval(self, poll_interval_s: float) -> None:
@@ -124,33 +134,44 @@ class ESPWorkerThread(QThread):
         self._commands.put(("refresh_max",))
 
     def jog_velocity(self, x_mm_s: float, y_mm_s: float) -> None:
-        self._commands.put(("jog_velocity", x_mm_s, y_mm_s))
+        generation = self._next_motion_generation()
+        self._commands.put(("jog_velocity", generation, x_mm_s, y_mm_s))
 
     def jog_normalized(self, x_norm: float, y_norm: float) -> None:
         with self._jog_lock:
-            self._pending_jog_normalized = (float(x_norm), float(y_norm))
+            self._motion_generation += 1
+            generation = self._motion_generation
+            self._pending_jog_normalized = (
+                generation,
+                float(x_norm),
+                float(y_norm),
+            )
             if self._jog_update_queued:
                 return
             self._jog_update_queued = True
         self._commands.put(("jog_update",))
 
     def stop_motion(self) -> None:
+        self._invalidate_motion_generation(clear_pending=True)
         self._commands.put(("stop",))
 
     def abort_motion(self) -> None:
+        self._invalidate_motion_generation(clear_pending=True)
         self._commands.put(("abort",))
 
     def enable_all_motors(self) -> None:
         self._commands.put(("enable_all",))
 
     def disable_all_motors(self) -> None:
+        self._invalidate_motion_generation(clear_pending=True)
         self._commands.put(("disable_all",))
 
     def zero_xy(self) -> None:
         self._commands.put(("zero",))
 
-    def goto_xy(self, x_mm: float, y_mm: float) -> None:
-        self._commands.put(("goto", x_mm, y_mm))
+    def goto_xy(self, x_mm: float, y_mm: float, speed_mm_s: float) -> None:
+        self._invalidate_motion_generation(clear_pending=True)
+        self._commands.put(("goto", x_mm, y_mm, speed_mm_s))
 
     def _process_command(self, command: tuple) -> None:
         name = command[0]
@@ -169,15 +190,46 @@ class ESPWorkerThread(QThread):
             elif name == "refresh_max":
                 self._refresh_max_velocity()
             elif name == "jog_velocity":
-                if self._controller and self._controller.is_connected:
-                    self._apply_velocity(command[1], command[2])
+                if (
+                    not self._goto_active
+                    and self._controller
+                    and self._controller.is_connected
+                ):
+                    self._apply_velocity(
+                        command[2],
+                        command[3],
+                        generation=command[1],
+                    )
             elif name == "jog_update":
                 motion = self._take_pending_jog_normalized()
-                if motion and self._controller and self._controller.is_connected:
-                    self._apply_normalized_velocity(*motion)
+                if (
+                    motion
+                    and not self._goto_active
+                    and self._controller
+                    and self._controller.is_connected
+                ):
+                    generation, x_norm, y_norm = motion
+                    self._apply_normalized_velocity(
+                        x_norm,
+                        y_norm,
+                        generation=generation,
+                    )
             elif name == "jog_normalized":
-                if self._controller and self._controller.is_connected:
-                    self._apply_normalized_velocity(command[1], command[2])
+                if (
+                    not self._goto_active
+                    and self._controller
+                    and self._controller.is_connected
+                ):
+                    if len(command) == 4:
+                        generation, x_norm, y_norm = command[1:]
+                    else:
+                        generation = None
+                        x_norm, y_norm = command[1:]
+                    self._apply_normalized_velocity(
+                        x_norm,
+                        y_norm,
+                        generation=generation,
+                    )
             elif name == "stop":
                 self._stop_motion()
             elif name == "abort":
@@ -193,8 +245,7 @@ class ESPWorkerThread(QThread):
                 self._require_controller().zero_xy()
                 self._poll_snapshot()
             elif name == "goto":
-                self._stop_motion()
-                self._require_controller().goto_xy_mm(command[1], command[2])
+                self._run_goto(command[1], command[2], command[3])
         except Exception as exc:
             self.error_message.emit(str(exc))
 
@@ -246,6 +297,10 @@ class ESPWorkerThread(QThread):
         with self._jog_lock:
             self._pending_jog_normalized = None
             self._jog_update_queued = False
+            self._motion_generation += 1
+        if self._goto_active:
+            self._goto_active = False
+            self.goto_active_changed.emit(False)
         return True
 
     def _require_controller(self) -> ESP300Controller:
@@ -270,7 +325,25 @@ class ESPWorkerThread(QThread):
             if not quiet:
                 self.error_message.emit(f"Position poll failed: {exc}")
 
-    def _take_pending_jog_normalized(self) -> Optional[tuple[float, float]]:
+    def _next_motion_generation(self) -> int:
+        with self._jog_lock:
+            self._motion_generation += 1
+            return self._motion_generation
+
+    def _invalidate_motion_generation(self, clear_pending: bool = False) -> None:
+        with self._jog_lock:
+            self._motion_generation += 1
+            if clear_pending:
+                self._pending_jog_normalized = None
+                self._jog_update_queued = False
+
+    def _is_stale_motion_generation(self, generation: Optional[int]) -> bool:
+        if generation is None:
+            return False
+        with self._jog_lock:
+            return generation != self._motion_generation
+
+    def _take_pending_jog_normalized(self) -> Optional[tuple[int, float, float]]:
         with self._jog_lock:
             motion = self._pending_jog_normalized
             self._pending_jog_normalized = None
@@ -282,15 +355,50 @@ class ESPWorkerThread(QThread):
         controller.refresh_max_velocities()
         self.max_jog_speed_changed.emit(controller.max_jog_speed_mm_s)
 
-    def _apply_normalized_velocity(self, x_norm: float, y_norm: float) -> None:
+    def _apply_normalized_velocity(
+        self,
+        x_norm: float,
+        y_norm: float,
+        generation: Optional[int] = None,
+    ) -> None:
         controller = self._require_controller()
         x = x_norm * controller.max_velocity_mm_s.get(1, 0.0)
         y = y_norm * controller.max_velocity_mm_s.get(2, 0.0)
-        self._apply_velocity(x, y)
+        self._apply_velocity(x, y, generation=generation)
 
-    def _apply_velocity(self, x_mm_s: float, y_mm_s: float) -> None:
-        self._set_axis_velocity(1, x_mm_s)
-        self._set_axis_velocity(2, y_mm_s)
+    def _apply_velocity(
+        self,
+        x_mm_s: float,
+        y_mm_s: float,
+        generation: Optional[int] = None,
+    ) -> None:
+        controller = self._require_controller()
+        target = {1: float(x_mm_s), 2: float(y_mm_s)}
+        previous = dict(self._active_velocity_mm_s)
+        was_moving = any(abs(value) > 1e-9 for value in previous.values())
+        target_moving = any(abs(value) > 1e-9 for value in target.values())
+        reversing = any(
+            abs(previous[axis]) > 1e-9
+            and abs(target[axis]) > 1e-9
+            and previous[axis] * target[axis] < 0
+            for axis in (1, 2)
+        )
+
+        if was_moving and not target_moving:
+            controller.stop_and_wait_until_done(sync_before=False)
+            self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
+            return
+
+        if reversing:
+            controller.stop_and_wait_until_done(sync_before=False)
+            self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
+            if self._is_stale_motion_generation(generation):
+                return
+
+        for axis, velocity_mm_s in target.items():
+            if self._is_stale_motion_generation(generation):
+                return
+            self._set_axis_velocity(axis, velocity_mm_s)
 
     def _set_axis_velocity(self, axis: int, velocity_mm_s: float) -> None:
         controller = self._require_controller()
@@ -298,14 +406,17 @@ class ESPWorkerThread(QThread):
         previous = self._active_velocity_mm_s[axis]
         if abs(velocity_mm_s) < 1e-9:
             if abs(previous) > 1e-9:
-                controller.stop_axis(axis)
+                controller.stop_axis_and_wait_until_done(axis, sync_before=False)
                 self._active_velocity_mm_s[axis] = 0.0
             return
 
         direction = 1 if velocity_mm_s > 0 else -1
         previous_direction = 1 if previous > 0 else -1 if previous < 0 else 0
         if previous_direction and previous_direction != direction:
-            controller.stop_axis(axis)
+            controller.stop_axis_and_wait_until_done(axis, sync_before=False)
+            self._active_velocity_mm_s[axis] = 0.0
+            previous = 0.0
+            previous_direction = 0
 
         speed = abs(velocity_mm_s)
         if (
@@ -318,7 +429,7 @@ class ESPWorkerThread(QThread):
     def _stop_motion(self) -> None:
         if not self._controller or not self._controller.is_connected:
             return
-        self._controller.stop_all()
+        self._controller.stop_and_wait_until_done(sync_before=False)
         self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
 
     def _abort_motion(self) -> None:
@@ -326,6 +437,134 @@ class ESPWorkerThread(QThread):
             return
         self._controller.abort()
         self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
+
+    def _run_goto(self, x_mm: float, y_mm: float, speed_mm_s: float) -> None:
+        deferred_commands: list[tuple] = []
+        self._goto_active = True
+        self.goto_active_changed.emit(True)
+        try:
+            if not self._stop_motion_for_goto(deferred_commands):
+                return
+            controller = self._require_controller()
+            if self._drain_goto_wait_commands(deferred_commands):
+                controller.wait_until_axes_done(
+                    timeout_s=10.0,
+                    poll_interval_s=0.05,
+                )
+                self._safe_poll_snapshot(
+                    timeout_s=BACKGROUND_POLL_TIMEOUT_S,
+                    quiet=True,
+                )
+                return
+            start_x_mm, start_y_mm = controller.read_position_mm()
+            timeout_s = self._goto_sync_timeout_s(
+                start_x_mm,
+                start_y_mm,
+                x_mm,
+                y_mm,
+                speed_mm_s,
+            )
+            controller.goto_xy_mm(x_mm, y_mm, speed_mm_s=speed_mm_s)
+            time.sleep(0.02)
+            if self._wait_for_goto_done(deferred_commands, timeout_s, "goto move"):
+                self._safe_poll_snapshot(
+                    timeout_s=BACKGROUND_POLL_TIMEOUT_S,
+                    quiet=True,
+                )
+        finally:
+            self._goto_active = False
+            self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
+            self._invalidate_motion_generation(clear_pending=True)
+            self.goto_active_changed.emit(False)
+            for command in deferred_commands:
+                self._commands.put(command)
+
+    def _stop_motion_for_goto(self, deferred_commands: list[tuple]) -> bool:
+        controller = self._require_controller()
+        controller.stop_all()
+        self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
+        return self._wait_for_goto_done(
+            deferred_commands,
+            timeout_s=10.0,
+            description="pre-goto stop",
+        )
+
+    def _goto_sync_timeout_s(
+        self,
+        start_x_mm: float,
+        start_y_mm: float,
+        target_x_mm: float,
+        target_y_mm: float,
+        speed_mm_s: float,
+    ) -> float:
+        speed_mm_s = max(abs(float(speed_mm_s)), 1e-6)
+        travel_s = max(
+            abs(float(target_x_mm) - float(start_x_mm)),
+            abs(float(target_y_mm) - float(start_y_mm)),
+        ) / speed_mm_s
+        return max(GOTO_SYNC_TIMEOUT_S, travel_s * 3.0 + 30.0)
+
+    def _wait_for_goto_done(
+        self,
+        deferred_commands: list[tuple],
+        timeout_s: float,
+        description: str,
+    ) -> bool:
+        controller = self._require_controller()
+        deadline = time.monotonic() + timeout_s
+        last_error: Optional[Exception] = None
+
+        while self._running and time.monotonic() < deadline:
+            if self._drain_goto_wait_commands(deferred_commands):
+                controller.wait_until_axes_done(
+                    timeout_s=10.0,
+                    poll_interval_s=0.05,
+                )
+                self._safe_poll_snapshot(timeout_s=BACKGROUND_POLL_TIMEOUT_S, quiet=True)
+                return False
+
+            try:
+                if controller.axes_motion_done():
+                    controller.synchronize_response_stream()
+                    return True
+            except Exception as exc:
+                last_error = exc
+                controller.transport.clear_pending()
+                try:
+                    controller.synchronize_response_stream()
+                except Exception as sync_exc:
+                    last_error = sync_exc
+
+            time.sleep(GOTO_DONE_POLL_INTERVAL_S)
+
+        if not self._running:
+            return False
+        detail = f": {last_error}" if last_error else ""
+        raise ESP300Error(f"Timed out waiting for {description} to finish{detail}")
+
+    def _drain_goto_wait_commands(self, deferred_commands: list[tuple]) -> bool:
+        interrupted = False
+        while True:
+            try:
+                command = self._commands.get_nowait()
+            except queue.Empty:
+                return interrupted
+
+            name = command[0]
+            if name == "abort":
+                self._abort_motion()
+                interrupted = True
+            elif name == "stop":
+                self._stop_motion()
+                interrupted = True
+            elif name == "jog_update":
+                self._take_pending_jog_normalized()
+            elif name in {"jog_velocity", "jog_normalized"}:
+                continue
+            elif name == "wake":
+                self._running = False
+            else:
+                deferred_commands.append(command)
 
 
 class JoystickPollingThread(QThread):
@@ -379,7 +618,7 @@ class JoystickPollingThread(QThread):
 
     def _map_report(self, report) -> tuple[float, float]:
         x = self._map_axis(report.x_raw)
-        y = self._map_axis(report.y_raw)
+        y = -self._map_axis(report.y_raw)
         if self._setting("swap_xy", False):
             x, y = y, x
         if self._setting("flip_x", False):
@@ -439,22 +678,45 @@ class JoystickPollingThread(QThread):
         self.activity_changed.emit(level)
 
     def _emit_connection_if_changed(self, connected: bool, error: str) -> None:
-        if connected:
-            backend = self._manager.backend
-            if backend:
-                status = (
-                    f"Connected ({JOYSTICK_VID:04X}:{JOYSTICK_PID:04X} via "
-                    f"{backend})"
-                )
-            else:
-                status = f"Connected ({JOYSTICK_VID:04X}:{JOYSTICK_PID:04X})"
-        else:
-            status = error or "Disconnected"
+        status = self._display_status_for_connection(connected, error)
         if connected == self._last_connected and status == self._last_status:
             return
         self.connection_changed.emit(connected, status)
         self._last_connected = connected
         self._last_status = status
+
+    def _display_status_for_connection(self, connected: bool, error: str) -> str:
+        if connected:
+            return JOYSTICK_STATUS_CONNECTED
+
+        message = error.lower()
+        cannot_connect_tokens = (
+            "open failed",
+            "read failed",
+            "report parse failed",
+            "claim",
+            "access",
+            "permission",
+        )
+        if any(token in message for token in cannot_connect_tokens):
+            return JOYSTICK_STATUS_CANNOT_CONNECT
+        if "not found" in message:
+            return JOYSTICK_STATUS_NOT_FOUND
+
+        library_tokens = (
+            "not installed",
+            "not importable",
+            "no backend",
+            "backend unavailable",
+            "could not load",
+            "libusb",
+            "hidapi enumerate failed",
+        )
+        if any(token in message for token in library_tokens):
+            return JOYSTICK_STATUS_NO_LIBRARY
+        if not error:
+            return JOYSTICK_STATUS_NOT_FOUND
+        return JOYSTICK_STATUS_CANNOT_CONNECT
 
     def _setting(self, name: str, default):
         with self._settings_lock:
@@ -611,6 +873,7 @@ class MainWindow(QMainWindow):
         self.current_position = (0.0, 0.0)
         self.pressed_directions: set[tuple[str, int]] = set()
         self.all_motors_enabled: Optional[bool] = None
+        self.goto_active = False
         self._last_motor_enable_prompt_s = 0.0
 
         self._build_menu()
@@ -624,6 +887,7 @@ class MainWindow(QMainWindow):
         self.esp_worker.connected_changed.connect(self.on_esp_connection_changed)
         self.esp_worker.snapshot_ready.connect(self.on_snapshot_ready)
         self.esp_worker.max_jog_speed_changed.connect(self.on_max_jog_speed_changed)
+        self.esp_worker.goto_active_changed.connect(self.on_goto_active_changed)
         self.esp_worker.log_message.connect(self.append_log)
         self.esp_worker.error_message.connect(self.on_worker_error)
         self.esp_worker.start()
@@ -833,7 +1097,7 @@ class MainWindow(QMainWindow):
 
         joystick_group = QGroupBox("Joystick")
         joystick_layout = QFormLayout(joystick_group)
-        self.joystick_status = QLabel("Scanning...")
+        self.joystick_status = QLabel(JOYSTICK_STATUS_NOT_FOUND)
         self.joystick_activity_lamp = QLabel()
         self.joystick_activity_lamp.setFixedSize(18, 18)
         self.joystick_activity_lamp.setToolTip(
@@ -989,6 +1253,15 @@ class MainWindow(QMainWindow):
         self.max_jog_speed_mm_s = max_speed_mm_s
         self.apply_controller_limits()
 
+    def on_goto_active_changed(self, active: bool) -> None:
+        self.goto_active = active
+        if active:
+            self.pressed_directions.clear()
+            self.statusBar().showMessage("Goto running; jogging disabled")
+        else:
+            self.statusBar().showMessage("Goto ended")
+        self.update_jog_controls()
+
     def on_worker_error(self, message: str) -> None:
         self.statusBar().showMessage(message)
         if not self.esp_connected:
@@ -1117,6 +1390,9 @@ class MainWindow(QMainWindow):
             self.settings.jog_speed_mm_s = max_speed
 
     def _set_direction_pressed(self, axis: str, direction: int, pressed: bool) -> None:
+        if self.goto_active:
+            self.pressed_directions.clear()
+            return
         item = (axis, direction)
         if pressed:
             self.pressed_directions.add(item)
@@ -1134,6 +1410,8 @@ class MainWindow(QMainWindow):
         self.send_joystick_motion(x_norm, y_norm)
 
     def send_joystick_motion(self, x_norm: float, y_norm: float) -> None:
+        if self.goto_active:
+            return
         if self.joystick_motion_blocked_by_motor_state(x_norm, y_norm):
             self.prompt_enable_motors_for_jog()
             return
@@ -1256,6 +1534,18 @@ class MainWindow(QMainWindow):
         else:
             self.motor_power_button.setText("Enable all motors")
 
+    def update_jog_controls(self) -> None:
+        if not hasattr(self, "up_button"):
+            return
+        enabled = not self.goto_active
+        for button in (
+            self.up_button,
+            self.down_button,
+            self.left_button,
+            self.right_button,
+        ):
+            button.setEnabled(enabled)
+
     def format_motor_status(self, state) -> str:
         if state is None:
             return "--"
@@ -1308,10 +1598,13 @@ class MainWindow(QMainWindow):
         dialog = GotoDialog(*self.current_position, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self.stop_all()
+        self.pressed_directions.clear()
         x_mm, y_mm = dialog.target
-        self.esp_worker.goto_xy(x_mm, y_mm)
-        self.statusBar().showMessage(f"Goto sent: X {x_mm:.6f}, Y {y_mm:.6f}")
+        speed_mm_s = self.settings.jog_speed_mm_s
+        self.esp_worker.goto_xy(x_mm, y_mm, speed_mm_s)
+        self.statusBar().showMessage(
+            f"Goto sent: X {x_mm:.6f}, Y {y_mm:.6f} at {speed_mm_s:.6g} mm/s"
+        )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API name
         self.save_config()

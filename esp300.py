@@ -397,21 +397,63 @@ class ESP300Controller:
         self,
         timeout_s: float = 10.0,
         poll_interval_s: float = 0.1,
+        sync_before: bool = True,
     ) -> None:
-        try:
-            self.synchronize_response_stream()
-        except Exception:
-            self.transport.clear_pending()
+        if sync_before:
+            try:
+                self.synchronize_response_stream()
+            except Exception:
+                self.transport.clear_pending()
 
         self.stop_all()
+        self._wait_until_axes_done(
+            (1, 2),
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+            description="axes",
+        )
+
+    def stop_axis_and_wait_until_done(
+        self,
+        axis: int,
+        timeout_s: float = 10.0,
+        poll_interval_s: float = 0.1,
+        sync_before: bool = True,
+    ) -> None:
+        if axis not in (1, 2):
+            raise ESP300Error(f"Unsupported axis {axis}")
+        if sync_before:
+            try:
+                self.synchronize_response_stream()
+            except Exception:
+                self.transport.clear_pending()
+
+        self.stop_axis(axis)
+        self._wait_until_axes_done(
+            (axis,),
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+            description=f"axis {axis}",
+        )
+
+    def _wait_until_axes_done(
+        self,
+        axes: tuple[int, ...],
+        timeout_s: float,
+        poll_interval_s: float,
+        description: str,
+        interrupt_callback: Optional[Callable[[], bool]] = None,
+    ) -> bool:
         deadline = time.monotonic() + timeout_s
         last_error: Optional[Exception] = None
 
         while time.monotonic() < deadline:
+            if interrupt_callback and interrupt_callback():
+                return False
             try:
-                if self.axes_motion_done():
+                if all(self.axis_motion_done(axis) for axis in axes):
                     self.synchronize_response_stream()
-                    return
+                    return True
             except Exception as exc:
                 last_error = exc
                 self.transport.clear_pending()
@@ -422,7 +464,21 @@ class ESP300Controller:
             time.sleep(poll_interval_s)
 
         detail = f": {last_error}" if last_error else ""
-        raise ESP300Error(f"Timed out waiting for axes to stop{detail}")
+        raise ESP300Error(f"Timed out waiting for {description} to stop{detail}")
+
+    def wait_until_axes_done(
+        self,
+        timeout_s: float = 60.0,
+        poll_interval_s: float = 0.1,
+        interrupt_callback: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        return self._wait_until_axes_done(
+            (1, 2),
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+            description="axes",
+            interrupt_callback=interrupt_callback,
+        )
 
     def axes_motion_done(self) -> bool:
         return all(self.axis_motion_done(axis) for axis in (1, 2))
@@ -528,13 +584,7 @@ class ESP300Controller:
             return
         if axis not in (1, 2):
             raise ESP300Error(f"Unsupported axis {axis}")
-        max_speed = self.max_velocity_mm_s.get(axis, 0.0)
-        if max_speed > 0 and speed_mm_s > max_speed:
-            raise ESP300Error(
-                f"Requested jog speed {speed_mm_s:g} mm/s exceeds axis {axis} "
-                f"maximum {max_speed:g} mm/s"
-            )
-        speed = abs(self.axis_scales[axis].controller_units_from_mm(speed_mm_s))
+        speed = self._axis_velocity_controller_units(axis, speed_mm_s, "jog")
         sign = "+" if direction > 0 else "-"
         self.transport.write(f"{axis}VA{_fmt(speed)};{axis}MV{sign}")
 
@@ -549,12 +599,42 @@ class ESP300Controller:
     def abort(self) -> None:
         self.transport.write("AB")
 
-    def goto_xy_mm(self, x_mm: float, y_mm: float) -> None:
+    def goto_xy_mm(
+        self,
+        x_mm: float,
+        y_mm: float,
+        speed_mm_s: Optional[float] = None,
+    ) -> None:
         x = self.axis_scales[1].controller_units_from_mm(x_mm)
         y = self.axis_scales[2].controller_units_from_mm(y_mm)
+        commands = []
+        if speed_mm_s is not None:
+            x_speed = self._axis_velocity_controller_units(1, speed_mm_s, "goto")
+            y_speed = self._axis_velocity_controller_units(2, speed_mm_s, "goto")
+            commands.extend((f"1VA{_fmt(x_speed)}", f"2VA{_fmt(y_speed)}"))
         # Issuing both absolute moves on one line starts them as close together as
         # the controller command parser allows without leaving axes in a group.
-        self.transport.write(f"1PA{_fmt(x)};2PA{_fmt(y)}")
+        commands.extend((f"1PA{_fmt(x)}", f"2PA{_fmt(y)}"))
+        self.transport.write(";".join(commands))
+
+    def _axis_velocity_controller_units(
+        self,
+        axis: int,
+        speed_mm_s: float,
+        purpose: str,
+    ) -> float:
+        if axis not in (1, 2):
+            raise ESP300Error(f"Unsupported axis {axis}")
+        speed_mm_s = abs(float(speed_mm_s))
+        if speed_mm_s <= 0:
+            raise ESP300Error(f"Requested {purpose} speed must be greater than zero")
+        max_speed = self.max_velocity_mm_s.get(axis, 0.0)
+        if max_speed > 0 and speed_mm_s > max_speed:
+            raise ESP300Error(
+                f"Requested {purpose} speed {speed_mm_s:g} mm/s exceeds axis {axis} "
+                f"maximum {max_speed:g} mm/s"
+            )
+        return abs(self.axis_scales[axis].controller_units_from_mm(speed_mm_s))
 
     def logical_axis_to_physical(
         self,

@@ -41,6 +41,10 @@ report instead of the 10-byte PyUSB interrupt packet. This is acceptable as long
 as the first 7 decoded bytes are present. The current parser accepts shorter
 reports and auto-detects whether byte `0` is an HID report ID or the X low byte.
 
+For the ESP300 joystick app, the physical joystick's Y axis is inverted before
+the user-facing `Swap X/Y`, `Flip X`, and `Flip Y` options are applied. This
+makes the physical joystick's Y direction match the emulated joystick buttons.
+
 | Byte offset | Field | Decode | Notes |
 | --- | --- | --- | --- |
 | `0` | X low byte | `x_raw = data[0] \| (data[1] << 8)` | Little-endian unsigned value |
