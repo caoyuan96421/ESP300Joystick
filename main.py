@@ -363,7 +363,14 @@ class JoystickPollingThread(QThread):
 
     def _emit_connection_if_changed(self, connected: bool, error: str) -> None:
         if connected:
-            status = f"Connected ({JOYSTICK_VID:04X}:{JOYSTICK_PID:04X})"
+            backend = self._manager.backend
+            if backend:
+                status = (
+                    f"Connected ({JOYSTICK_VID:04X}:{JOYSTICK_PID:04X} via "
+                    f"{backend})"
+                )
+            else:
+                status = f"Connected ({JOYSTICK_VID:04X}:{JOYSTICK_PID:04X})"
         else:
             status = error or "Disconnected"
         if connected == self._last_connected and status == self._last_status:

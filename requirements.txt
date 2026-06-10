@@ -3,3 +3,4 @@ pyserial
 pyvisa
 pyusb
 libusb-package
+hidapi
