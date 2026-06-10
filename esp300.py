@@ -42,6 +42,9 @@ class ESP300Transport(Protocol):
     def clear_pending(self) -> None:
         ...
 
+    def clear_buffers(self) -> None:
+        ...
+
     def temporary_timeout(self, timeout_s: Optional[float]) -> Iterator[None]:
         ...
 
@@ -117,6 +120,13 @@ class SerialTransport:
     def clear_pending(self) -> None:
         if self._serial and self._serial.is_open:
             self._serial.reset_input_buffer()
+
+    def clear_buffers(self) -> None:
+        if not self._serial or not self._serial.is_open:
+            return
+        self._log("!! clearing RS232 input/output buffers")
+        self._serial.reset_input_buffer()
+        self._serial.reset_output_buffer()
 
     @contextmanager
     def temporary_timeout(self, timeout_s: Optional[float]) -> Iterator[None]:
@@ -194,6 +204,25 @@ class VisaTransport:
             return
         try:
             self._resource.clear()
+        except Exception:
+            pass
+
+    def clear_buffers(self) -> None:
+        if not self._resource:
+            return
+        self._log("!! clearing GPIB device/buffers")
+        try:
+            self._resource.clear()
+        except Exception:
+            pass
+        try:
+            import pyvisa
+
+            mask = (
+                pyvisa.constants.BufferOperation.discard_read_buffer
+                | pyvisa.constants.BufferOperation.discard_write_buffer
+            )
+            self._resource.flush(mask)
         except Exception:
             pass
 
@@ -304,6 +333,7 @@ class ESP300Controller:
     def connect(self) -> None:
         self.transport.open()
         try:
+            self.transport.clear_buffers()
             self.refresh_axis_units()
             self.refresh_max_velocities()
         except Exception:

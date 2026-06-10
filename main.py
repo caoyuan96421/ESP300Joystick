@@ -596,6 +596,7 @@ class MainWindow(QMainWindow):
         self.current_position = (0.0, 0.0)
         self.pressed_directions: set[tuple[str, int]] = set()
         self.all_motors_enabled: Optional[bool] = None
+        self._last_motor_enable_prompt_s = 0.0
 
         self._build_menu()
         self._build_ui()
@@ -621,7 +622,7 @@ class MainWindow(QMainWindow):
         self.joystick_worker.connection_changed.connect(
             self.on_joystick_connection_changed
         )
-        self.joystick_worker.motion_changed.connect(self.esp_worker.jog_normalized)
+        self.joystick_worker.motion_changed.connect(self.send_joystick_motion)
         self.joystick_worker.activity_changed.connect(self.on_joystick_activity_changed)
         self.append_log(
             f"Joystick poll interval: {self.settings.joystick_poll_interval_s:.3f} s"
@@ -1115,7 +1116,33 @@ class MainWindow(QMainWindow):
 
     def apply_emulated_joystick(self) -> None:
         x_norm, y_norm = self.emulated_joystick_motion()
+        self.send_joystick_motion(x_norm, y_norm)
+
+    def send_joystick_motion(self, x_norm: float, y_norm: float) -> None:
+        if self.joystick_motion_blocked_by_motor_state(x_norm, y_norm):
+            self.prompt_enable_motors_for_jog()
+            return
         self.esp_worker.jog_normalized(x_norm, y_norm)
+
+    def joystick_motion_blocked_by_motor_state(
+        self,
+        x_norm: float,
+        y_norm: float,
+    ) -> bool:
+        moving = abs(x_norm) > 1e-9 or abs(y_norm) > 1e-9
+        return moving and self.esp_connected and self.all_motors_enabled is not True
+
+    def prompt_enable_motors_for_jog(self) -> None:
+        now = time.monotonic()
+        if now - self._last_motor_enable_prompt_s < 5.0:
+            return
+        self._last_motor_enable_prompt_s = now
+        self.statusBar().showMessage("Enable both motors before jogging")
+        QMessageBox.information(
+            self,
+            "Motors are off",
+            "Enable both motors before using the joystick.",
+        )
 
     def transform_logical_motion(
         self,
