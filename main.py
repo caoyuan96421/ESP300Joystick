@@ -86,11 +86,8 @@ class ESPWorkerThread(QThread):
                 and self._controller.is_connected
                 and time.monotonic() >= next_poll
                 and self._commands.empty()
-                and not self._motion_active()
             ):
-                self._safe_poll_snapshot()
-                next_poll = time.monotonic() + self._poll_interval_s
-            elif self._motion_active():
+                self._safe_poll_snapshot(timeout_s=0.0, quiet=True)
                 next_poll = time.monotonic() + self._poll_interval_s
 
         self._close_controller()
@@ -241,20 +238,22 @@ class ESPWorkerThread(QThread):
             raise ESP300Error("Connect to the ESP300 first")
         return self._controller
 
-    def _poll_snapshot(self) -> None:
+    def _poll_snapshot(self, timeout_s: Optional[float] = None) -> None:
         if not self._controller or not self._controller.is_connected:
             return
-        snapshot = self._controller.read_snapshot()
+        snapshot = self._controller.read_snapshot(timeout_s=timeout_s)
         self.snapshot_ready.emit(snapshot)
 
-    def _safe_poll_snapshot(self) -> None:
+    def _safe_poll_snapshot(
+        self,
+        timeout_s: Optional[float] = None,
+        quiet: bool = False,
+    ) -> None:
         try:
-            self._poll_snapshot()
+            self._poll_snapshot(timeout_s=timeout_s)
         except Exception as exc:
-            self.error_message.emit(f"Position poll failed: {exc}")
-
-    def _motion_active(self) -> bool:
-        return any(abs(value) > 1e-9 for value in self._active_velocity_mm_s.values())
+            if not quiet:
+                self.error_message.emit(f"Position poll failed: {exc}")
 
     def _take_pending_jog_normalized(self) -> Optional[tuple[float, float]]:
         with self._jog_lock:
@@ -317,7 +316,7 @@ class ESPWorkerThread(QThread):
 class JoystickPollingThread(QThread):
     connection_changed = Signal(bool, str)
     motion_changed = Signal(float, float)
-    report_message = Signal(str)
+    activity_changed = Signal(int)
 
     def __init__(
         self,
@@ -332,7 +331,7 @@ class JoystickPollingThread(QThread):
         self._last_motion = (0.0, 0.0)
         self._last_connected: Optional[bool] = None
         self._last_status = ""
-        self._report_logs_remaining = 3
+        self._last_activity_level = 0
 
     def update_settings(self, settings: ESP300Settings) -> None:
         with self._settings_lock:
@@ -349,13 +348,14 @@ class JoystickPollingThread(QThread):
 
             interval_s = self._setting("joystick_poll_interval_s", 0.1)
             if not self._manager.connected:
+                self._emit_activity_if_changed(0)
                 self._emit_motion_if_changed((0.0, 0.0))
                 self.msleep(max(10, int(interval_s * 1000)))
                 continue
 
             report = self._manager.read_latest()
             if report is not None:
-                self._emit_report_debug(report)
+                self._emit_activity_if_changed(self._report_activity_level(report))
                 self._emit_motion_if_changed(self._map_report(report))
             self.msleep(max(10, int(interval_s * 1000)))
 
@@ -374,7 +374,7 @@ class JoystickPollingThread(QThread):
         return round(x, 4), round(y, 4)
 
     def _map_axis(self, raw: int) -> float:
-        centered = max(-1.0, min(1.0, (float(raw) - 512.0) / 512.0))
+        centered = self._axis_centered(raw)
         sign = 1.0 if centered >= 0 else -1.0
         magnitude = abs(centered)
         low = max(0.0, min(0.95, self._setting("low_deadband_percent", 5.0) / 100.0))
@@ -389,6 +389,24 @@ class JoystickPollingThread(QThread):
         scaled = (magnitude - low) / active_span
         return sign * (scaled ** max(1.0, self._setting("joystick_exponent", 5.0)))
 
+    def _report_activity_level(self, report) -> int:
+        low = max(0.0, min(0.95, self._setting("low_deadband_percent", 5.0) / 100.0))
+        high = max(
+            0.0, min(0.95, self._setting("high_deadband_percent", 10.0) / 100.0)
+        )
+        magnitudes = (
+            abs(self._axis_centered(report.x_raw)),
+            abs(self._axis_centered(report.y_raw)),
+        )
+        if any(magnitude >= 1.0 - high for magnitude in magnitudes):
+            return 2
+        if any(magnitude > low for magnitude in magnitudes):
+            return 1
+        return 0
+
+    def _axis_centered(self, raw: int) -> float:
+        return max(-1.0, min(1.0, (float(raw) - 512.0) / 512.0))
+
     def _emit_motion_if_changed(self, motion: tuple[float, float]) -> None:
         epsilon = JOYSTICK_MOTION_EPSILON
         if (
@@ -398,6 +416,12 @@ class JoystickPollingThread(QThread):
         ):
             self._last_motion = motion
             self.motion_changed.emit(*motion)
+
+    def _emit_activity_if_changed(self, level: int) -> None:
+        if level == self._last_activity_level:
+            return
+        self._last_activity_level = level
+        self.activity_changed.emit(level)
 
     def _emit_connection_if_changed(self, connected: bool, error: str) -> None:
         if connected:
@@ -416,18 +440,6 @@ class JoystickPollingThread(QThread):
         self.connection_changed.emit(connected, status)
         self._last_connected = connected
         self._last_status = status
-
-    def _emit_report_debug(self, report) -> None:
-        if self._report_logs_remaining <= 0:
-            return
-        raw = " ".join(f"{byte:02X}" for byte in report.raw)
-        self.report_message.emit(
-            "JOYSTICK REPORT: "
-            f"len={len(report.raw)} offset={report.data_offset} raw={raw} "
-            f"axes=({report.x_raw},{report.y_raw},{report.z_raw}) "
-            f"buttons=0x{report.button_byte:02X}"
-        )
-        self._report_logs_remaining -= 1
 
     def _setting(self, name: str, default):
         with self._settings_lock:
@@ -610,7 +622,7 @@ class MainWindow(QMainWindow):
             self.on_joystick_connection_changed
         )
         self.joystick_worker.motion_changed.connect(self.esp_worker.jog_normalized)
-        self.joystick_worker.report_message.connect(self.append_log)
+        self.joystick_worker.activity_changed.connect(self.on_joystick_activity_changed)
         self.append_log(
             f"Joystick poll interval: {self.settings.joystick_poll_interval_s:.3f} s"
         )
@@ -806,7 +818,14 @@ class MainWindow(QMainWindow):
         joystick_group = QGroupBox("Joystick")
         joystick_layout = QFormLayout(joystick_group)
         self.joystick_status = QLabel("Scanning...")
+        self.joystick_activity_lamp = QLabel()
+        self.joystick_activity_lamp.setFixedSize(18, 18)
+        self.joystick_activity_lamp.setToolTip(
+            "Black: idle, green: active, red: max band"
+        )
+        self.set_joystick_activity_lamp(0)
         joystick_layout.addRow("USB HID", self.joystick_status)
+        joystick_layout.addRow("Activity", self.joystick_activity_lamp)
         joystick_layout.addRow(
             "VID:PID",
             QLabel(f"{JOYSTICK_VID:04X}:{JOYSTICK_PID:04X}"),
@@ -963,7 +982,33 @@ class MainWindow(QMainWindow):
 
     def on_joystick_connection_changed(self, connected: bool, status: str) -> None:
         self.joystick_status.setText(status)
+        if not connected:
+            self.set_joystick_activity_lamp(0)
         self.append_log(f"JOYSTICK: {status}")
+
+    def on_joystick_activity_changed(self, level: int) -> None:
+        self.set_joystick_activity_lamp(level)
+
+    def set_joystick_activity_lamp(self, level: int) -> None:
+        if not hasattr(self, "joystick_activity_lamp"):
+            return
+        colors = {
+            0: "#050505",
+            1: "#12a150",
+            2: "#d22f27",
+        }
+        color = colors.get(level, colors[0])
+        self.joystick_activity_lamp.setStyleSheet(
+            "QLabel {"
+            f" background-color: {color};"
+            " border: 1px solid #555;"
+            " border-radius: 9px;"
+            " min-width: 18px;"
+            " max-width: 18px;"
+            " min-height: 18px;"
+            " max-height: 18px;"
+            "}"
+        )
 
     def _refresh_connection_ui(self, *_args) -> None:
         if not hasattr(self, "connect_button"):

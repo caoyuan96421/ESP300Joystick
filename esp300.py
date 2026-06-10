@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol
+from typing import Callable, Iterator, Optional, Protocol
 
 
 SERIAL_BAUDRATE = 19200
@@ -36,6 +37,12 @@ class ESP300Transport(Protocol):
         ...
 
     def query(self, command: str) -> str:
+        ...
+
+    def clear_pending(self) -> None:
+        ...
+
+    def temporary_timeout(self, timeout_s: Optional[float]) -> Iterator[None]:
         ...
 
     @property
@@ -107,6 +114,23 @@ class SerialTransport:
         if self.log_callback:
             self.log_callback(message)
 
+    def clear_pending(self) -> None:
+        if self._serial and self._serial.is_open:
+            self._serial.reset_input_buffer()
+
+    @contextmanager
+    def temporary_timeout(self, timeout_s: Optional[float]) -> Iterator[None]:
+        if not self._serial:
+            yield
+            return
+        old_timeout = self._serial.timeout
+        if timeout_s is not None:
+            self._serial.timeout = max(0.0, float(timeout_s))
+        try:
+            yield
+        finally:
+            self._serial.timeout = old_timeout
+
 
 class VisaTransport:
     def __init__(
@@ -164,6 +188,27 @@ class VisaTransport:
     def _log(self, message: str) -> None:
         if self.log_callback:
             self.log_callback(message)
+
+    def clear_pending(self) -> None:
+        if not self._resource:
+            return
+        try:
+            self._resource.clear()
+        except Exception:
+            pass
+
+    @contextmanager
+    def temporary_timeout(self, timeout_s: Optional[float]) -> Iterator[None]:
+        if not self._resource:
+            yield
+            return
+        old_timeout = self._resource.timeout
+        if timeout_s is not None:
+            self._resource.timeout = max(0, int(float(timeout_s) * 1000))
+        try:
+            yield
+        finally:
+            self._resource.timeout = old_timeout
 
 
 @dataclass(frozen=True)
@@ -296,13 +341,19 @@ class ESP300Controller:
         )
         return x, y
 
-    def read_snapshot(self) -> ControllerSnapshot:
-        x, y = self.read_position_mm()
-        return ControllerSnapshot(
-            x_mm=x,
-            y_mm=y,
-            axis_states=self.read_axis_states(),
-        )
+    def read_snapshot(self, timeout_s: Optional[float] = None) -> ControllerSnapshot:
+        try:
+            with self.transport.temporary_timeout(timeout_s):
+                x, y = self.read_position_mm()
+                return ControllerSnapshot(
+                    x_mm=x,
+                    y_mm=y,
+                    axis_states=self.read_axis_states(),
+                )
+        except Exception:
+            if timeout_s is not None:
+                self.transport.clear_pending()
+            raise
 
     def read_axis_states(self) -> dict[int, AxisState]:
         hardware_registers = self.read_hardware_status_registers()

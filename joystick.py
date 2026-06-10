@@ -25,8 +25,6 @@ class JoystickReport:
     z_raw: int
     button_byte: int
     tail: bytes
-    raw: bytes = b""
-    data_offset: int = 0
 
 
 class HIDJoystickManager:
@@ -265,7 +263,6 @@ class HIDJoystickManager:
 
 def parse_report(data) -> JoystickReport:
     data = list(data)
-    raw = bytes(data)
     if len(data) < 7:
         raise ValueError(f"Expected at least 7 report bytes, got {len(data)}")
 
@@ -282,8 +279,6 @@ def parse_report(data) -> JoystickReport:
         z_raw=payload[4] | (payload[5] << 8),
         button_byte=payload[6],
         tail=bytes(payload[7:]),
-        raw=raw,
-        data_offset=offset,
     )
 
 
