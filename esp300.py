@@ -482,7 +482,11 @@ class ESP300Controller:
                 )
         except Exception:
             if timeout_s is not None:
-                self.transport.clear_pending()
+                try:
+                    self.synchronize_response_stream()
+                except Exception:
+                    self.transport.clear_buffers()
+                    raise
             raise
 
     def read_axis_states(self) -> dict[int, AxisState]:

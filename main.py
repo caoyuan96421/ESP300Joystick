@@ -50,6 +50,7 @@ CONFIG_PATH = Path(__file__).with_name("config.json")
 CONFIG_VERSION = 2
 DEFAULT_JOYSTICK_POLL_INTERVAL_S = 0.1
 JOYSTICK_MOTION_EPSILON = 0.01
+BACKGROUND_POLL_TIMEOUT_S = 0.05
 
 
 class ESPWorkerThread(QThread):
@@ -87,7 +88,10 @@ class ESPWorkerThread(QThread):
                 and time.monotonic() >= next_poll
                 and self._commands.empty()
             ):
-                self._safe_poll_snapshot(timeout_s=0.0, quiet=True)
+                self._safe_poll_snapshot(
+                    timeout_s=BACKGROUND_POLL_TIMEOUT_S,
+                    quiet=True,
+                )
                 next_poll = time.monotonic() + self._poll_interval_s
 
         self._close_controller(force=True)
