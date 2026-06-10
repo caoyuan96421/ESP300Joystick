@@ -398,7 +398,8 @@ class ESP300Controller:
         timeout_s: float = 10.0,
         poll_interval_s: float = 0.1,
         sync_before: bool = True,
-    ) -> None:
+        interrupt_callback: Optional[Callable[[], bool]] = None,
+    ) -> bool:
         if sync_before:
             try:
                 self.synchronize_response_stream()
@@ -406,11 +407,12 @@ class ESP300Controller:
                 self.transport.clear_pending()
 
         self.stop_all()
-        self._wait_until_axes_done(
+        return self._wait_until_axes_done(
             (1, 2),
             timeout_s=timeout_s,
             poll_interval_s=poll_interval_s,
             description="axes",
+            interrupt_callback=interrupt_callback,
         )
 
     def stop_axis_and_wait_until_done(
@@ -419,7 +421,8 @@ class ESP300Controller:
         timeout_s: float = 10.0,
         poll_interval_s: float = 0.1,
         sync_before: bool = True,
-    ) -> None:
+        interrupt_callback: Optional[Callable[[], bool]] = None,
+    ) -> bool:
         if axis not in (1, 2):
             raise ESP300Error(f"Unsupported axis {axis}")
         if sync_before:
@@ -429,11 +432,12 @@ class ESP300Controller:
                 self.transport.clear_pending()
 
         self.stop_axis(axis)
-        self._wait_until_axes_done(
+        return self._wait_until_axes_done(
             (axis,),
             timeout_s=timeout_s,
             poll_interval_s=poll_interval_s,
             description=f"axis {axis}",
+            interrupt_callback=interrupt_callback,
         )
 
     def _wait_until_axes_done(

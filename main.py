@@ -385,12 +385,14 @@ class ESPWorkerThread(QThread):
         )
 
         if was_moving and not target_moving:
-            controller.stop_and_wait_until_done(sync_before=False)
+            if not self._stop_all_and_wait_for_transition():
+                return
             self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
             return
 
         if reversing:
-            controller.stop_and_wait_until_done(sync_before=False)
+            if not self._stop_all_and_wait_for_transition():
+                return
             self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
             if self._is_stale_motion_generation(generation):
                 return
@@ -406,14 +408,16 @@ class ESPWorkerThread(QThread):
         previous = self._active_velocity_mm_s[axis]
         if abs(velocity_mm_s) < 1e-9:
             if abs(previous) > 1e-9:
-                controller.stop_axis_and_wait_until_done(axis, sync_before=False)
+                if not self._stop_axis_and_wait_for_transition(axis):
+                    return
                 self._active_velocity_mm_s[axis] = 0.0
             return
 
         direction = 1 if velocity_mm_s > 0 else -1
         previous_direction = 1 if previous > 0 else -1 if previous < 0 else 0
         if previous_direction and previous_direction != direction:
-            controller.stop_axis_and_wait_until_done(axis, sync_before=False)
+            if not self._stop_axis_and_wait_for_transition(axis):
+                return
             self._active_velocity_mm_s[axis] = 0.0
             previous = 0.0
             previous_direction = 0
@@ -429,7 +433,7 @@ class ESPWorkerThread(QThread):
     def _stop_motion(self) -> None:
         if not self._controller or not self._controller.is_connected:
             return
-        self._controller.stop_and_wait_until_done(sync_before=False)
+        self._stop_all_and_wait_for_transition()
         self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
 
     def _abort_motion(self) -> None:
@@ -437,6 +441,53 @@ class ESPWorkerThread(QThread):
             return
         self._controller.abort()
         self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
+
+    def _stop_all_and_wait_for_transition(self) -> bool:
+        deferred_commands: list[tuple] = []
+        try:
+            return self._require_controller().stop_and_wait_until_done(
+                sync_before=False,
+                interrupt_callback=lambda: self._defer_wait_commands(
+                    deferred_commands
+                ),
+            )
+        finally:
+            self._requeue_deferred_commands(deferred_commands)
+
+    def _stop_axis_and_wait_for_transition(self, axis: int) -> bool:
+        deferred_commands: list[tuple] = []
+        try:
+            return self._require_controller().stop_axis_and_wait_until_done(
+                axis,
+                sync_before=False,
+                interrupt_callback=lambda: self._defer_wait_commands(
+                    deferred_commands
+                ),
+            )
+        finally:
+            self._requeue_deferred_commands(deferred_commands)
+
+    def _defer_wait_commands(self, deferred_commands: list[tuple]) -> bool:
+        interrupted = False
+        while True:
+            try:
+                command = self._commands.get_nowait()
+            except queue.Empty:
+                return interrupted
+
+            name = command[0]
+            if name == "abort":
+                self._abort_motion()
+                interrupted = True
+            elif name == "wake":
+                self._running = False
+                interrupted = True
+            else:
+                deferred_commands.append(command)
+
+    def _requeue_deferred_commands(self, deferred_commands: list[tuple]) -> None:
+        for command in deferred_commands:
+            self._commands.put(command)
 
     def _run_goto(self, x_mm: float, y_mm: float, speed_mm_s: float) -> None:
         deferred_commands: list[tuple] = []
