@@ -47,7 +47,10 @@ class HIDJoystickManager:
             except ImportError:
                 return self._set_disconnected_locked("PyUSB is not installed")
 
-            found = usb.core.find(idVendor=VID, idProduct=PID)
+            try:
+                found = self._find_device_locked(usb.core)
+            except Exception as exc:
+                return self._set_disconnected_locked(str(exc))
             if found is None:
                 return self._set_disconnected_locked("Joystick not found")
 
@@ -64,6 +67,38 @@ class HIDJoystickManager:
             self._connected = True
             self._last_error = ""
             return True, ""
+
+    def _find_device_locked(self, usb_core):
+        try:
+            return usb_core.find(idVendor=VID, idProduct=PID)
+        except Exception as exc:
+            if exc.__class__.__name__ != "NoBackendError":
+                raise
+            try:
+                import libusb_package
+                import usb.backend.libusb1
+            except ImportError as import_exc:
+                raise RuntimeError(
+                    "PyUSB backend missing; install libusb-package or libusb 1.0"
+                ) from import_exc
+
+            backend = None
+            if hasattr(libusb_package, "get_libusb1_backend"):
+                backend = libusb_package.get_libusb1_backend()
+            if backend is None and hasattr(libusb_package, "find_library"):
+                backend = usb.backend.libusb1.get_backend(
+                    find_library=libusb_package.find_library
+                )
+            if backend is None:
+                raise RuntimeError(
+                    "PyUSB backend missing; install libusb-package or libusb 1.0"
+                )
+            try:
+                return usb_core.find(idVendor=VID, idProduct=PID, backend=backend)
+            except Exception as backend_exc:
+                raise RuntimeError(
+                    f"PyUSB backend unavailable: {backend_exc}"
+                ) from backend_exc
 
     def read_latest(self) -> Optional[JoystickReport]:
         with self._lock:
