@@ -45,6 +45,9 @@ class ESP300Transport(Protocol):
     def clear_buffers(self) -> None:
         ...
 
+    def drain_input(self, timeout_s: float = 0.05, max_reads: int = 8) -> None:
+        ...
+
     def temporary_timeout(self, timeout_s: Optional[float]) -> Iterator[None]:
         ...
 
@@ -127,6 +130,21 @@ class SerialTransport:
         self._log("!! clearing RS232 input/output buffers")
         self._serial.reset_input_buffer()
         self._serial.reset_output_buffer()
+
+    def drain_input(self, timeout_s: float = 0.05, max_reads: int = 8) -> None:
+        if not self._serial or not self._serial.is_open:
+            return
+        old_timeout = self._serial.timeout
+        self._serial.timeout = max(0.0, float(timeout_s))
+        try:
+            for _ in range(max_reads):
+                response = self._serial.readline().decode("ascii", errors="replace")
+                response = response.strip()
+                if not response:
+                    break
+                self._log(f"<< discarded {response}")
+        finally:
+            self._serial.timeout = old_timeout
 
     @contextmanager
     def temporary_timeout(self, timeout_s: Optional[float]) -> Iterator[None]:
@@ -225,6 +243,23 @@ class VisaTransport:
             self._resource.flush(mask)
         except Exception:
             pass
+
+    def drain_input(self, timeout_s: float = 0.05, max_reads: int = 8) -> None:
+        if not self._resource:
+            return
+        old_timeout = self._resource.timeout
+        self._resource.timeout = max(0, int(float(timeout_s) * 1000))
+        try:
+            for _ in range(max_reads):
+                try:
+                    response = str(self._resource.read()).strip()
+                except Exception:
+                    break
+                if not response:
+                    break
+                self._log(f"<< discarded {response}")
+        finally:
+            self._resource.timeout = old_timeout
 
     @contextmanager
     def temporary_timeout(self, timeout_s: Optional[float]) -> Iterator[None]:
@@ -334,6 +369,7 @@ class ESP300Controller:
         self.transport.open()
         try:
             self.transport.clear_buffers()
+            self.synchronize_response_stream()
             self.refresh_axis_units()
             self.refresh_max_velocities()
         except Exception:
@@ -342,6 +378,19 @@ class ESP300Controller:
 
     def close(self) -> None:
         self.transport.close()
+
+    def synchronize_response_stream(self) -> None:
+        self.transport.drain_input()
+        for attempt in range(6):
+            response = self.transport.query("VE?")
+            if _looks_like_esp_identity(response):
+                self.transport.drain_input()
+                response = self.transport.query("VE?")
+                if _looks_like_esp_identity(response):
+                    return
+            else:
+                self.transport.drain_input(timeout_s=0.02, max_reads=2)
+        raise ESP300Error("Could not synchronize ESP300 response stream with VE?")
 
     def refresh_axis_units(self) -> None:
         for axis in (1, 2):
@@ -485,6 +534,15 @@ def _command_payload(command: str) -> str:
 
 def _fmt(value: float) -> str:
     return f"{value:.9g}"
+
+
+def _looks_like_esp_identity(response: str) -> bool:
+    identity = response.strip().upper()
+    return (
+        "ESP300" in identity
+        or "ESP301" in identity
+        or "ESP0300" in identity
+    )
 
 
 def find_esp300_gpib_resources(timeout_s: float = 0.5) -> list[VisaResourceInfo]:
