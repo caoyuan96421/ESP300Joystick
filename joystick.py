@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import threading
 from dataclasses import dataclass
 from typing import Optional
@@ -11,6 +12,10 @@ INTERFACE = 0
 IN_ENDPOINT = 0x81
 REPORT_LEN = 10
 READ_TIMEOUT_MS = 1
+BACKEND_INSTALL_HINT = (
+    "Install on the machine running the app: "
+    f"{sys.executable} -m pip install pyusb libusb-package"
+)
 
 
 @dataclass(frozen=True)
@@ -44,8 +49,10 @@ class HIDJoystickManager:
             try:
                 import usb.core
                 import usb.util
-            except ImportError:
-                return self._set_disconnected_locked("PyUSB is not installed")
+            except ImportError as exc:
+                return self._set_disconnected_locked(
+                    f"PyUSB is not installed ({exc}). {BACKEND_INSTALL_HINT}"
+                )
 
             try:
                 found = self._find_device_locked(usb.core)
@@ -79,19 +86,37 @@ class HIDJoystickManager:
                 import usb.backend.libusb1
             except ImportError as import_exc:
                 raise RuntimeError(
-                    "PyUSB backend missing; install libusb-package or libusb 1.0"
+                    "PyUSB/libusb backend package is not importable in this "
+                    f"Python environment: {import_exc}. Run "
+                    f"`{sys.executable} -m pip install --upgrade pyusb "
+                    "libusb-package` "
+                    "with the same Python used to start this app."
                 ) from import_exc
 
+            try:
+                return libusb_package.find(idVendor=VID, idProduct=PID)
+            except Exception as package_exc:
+                package_error = f"libusb_package.find failed: {package_exc}"
+
             backend = None
+            backend_errors = [package_error]
             if hasattr(libusb_package, "get_libusb1_backend"):
-                backend = libusb_package.get_libusb1_backend()
+                try:
+                    backend = libusb_package.get_libusb1_backend()
+                except Exception as exc:
+                    backend_errors.append(f"get_libusb1_backend failed: {exc}")
             if backend is None and hasattr(libusb_package, "find_library"):
-                backend = usb.backend.libusb1.get_backend(
-                    find_library=libusb_package.find_library
-                )
+                try:
+                    backend = usb.backend.libusb1.get_backend(
+                        find_library=libusb_package.find_library
+                    )
+                except Exception as exc:
+                    backend_errors.append(f"find_library backend failed: {exc}")
             if backend is None:
+                detail = "; ".join(backend_errors) or "no backend factory found"
                 raise RuntimeError(
-                    "PyUSB backend missing; install libusb-package or libusb 1.0"
+                    "libusb-package is installed, but PyUSB could not load a "
+                    f"libusb 1.0 backend ({detail})."
                 )
             try:
                 return usb_core.find(idVendor=VID, idProduct=PID, backend=backend)

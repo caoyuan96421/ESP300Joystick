@@ -297,6 +297,7 @@ class JoystickPollingThread(QThread):
         self._settings = asdict(settings)
         self._last_motion = (0.0, 0.0)
         self._last_connected: Optional[bool] = None
+        self._last_status = ""
 
     def update_settings(self, settings: ESP300Settings) -> None:
         with self._settings_lock:
@@ -361,14 +362,15 @@ class JoystickPollingThread(QThread):
             self.motion_changed.emit(*motion)
 
     def _emit_connection_if_changed(self, connected: bool, error: str) -> None:
-        if connected == self._last_connected:
-            return
         if connected:
             status = f"Connected ({JOYSTICK_VID:04X}:{JOYSTICK_PID:04X})"
         else:
             status = error or "Disconnected"
+        if connected == self._last_connected and status == self._last_status:
+            return
         self.connection_changed.emit(connected, status)
         self._last_connected = connected
+        self._last_status = status
 
     def _setting(self, name: str, default):
         with self._settings_lock:
@@ -895,6 +897,7 @@ class MainWindow(QMainWindow):
 
     def on_joystick_connection_changed(self, connected: bool, status: str) -> None:
         self.joystick_status.setText(status)
+        self.append_log(f"JOYSTICK: {status}")
 
     def _refresh_connection_ui(self, *_args) -> None:
         if not hasattr(self, "connect_button"):
