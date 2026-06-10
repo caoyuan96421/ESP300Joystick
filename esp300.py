@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Iterator, Optional, Protocol
@@ -391,6 +392,56 @@ class ESP300Controller:
             else:
                 self.transport.drain_input(timeout_s=0.02, max_reads=2)
         raise ESP300Error("Could not synchronize ESP300 response stream with VE?")
+
+    def stop_and_wait_until_done(
+        self,
+        timeout_s: float = 10.0,
+        poll_interval_s: float = 0.1,
+    ) -> None:
+        try:
+            self.synchronize_response_stream()
+        except Exception:
+            self.transport.clear_pending()
+
+        self.stop_all()
+        deadline = time.monotonic() + timeout_s
+        last_error: Optional[Exception] = None
+
+        while time.monotonic() < deadline:
+            try:
+                if self.axes_motion_done():
+                    self.synchronize_response_stream()
+                    return
+            except Exception as exc:
+                last_error = exc
+                self.transport.clear_pending()
+                try:
+                    self.synchronize_response_stream()
+                except Exception as sync_exc:
+                    last_error = sync_exc
+            time.sleep(poll_interval_s)
+
+        detail = f": {last_error}" if last_error else ""
+        raise ESP300Error(f"Timed out waiting for axes to stop{detail}")
+
+    def axes_motion_done(self) -> bool:
+        return all(self.axis_motion_done(axis) for axis in (1, 2))
+
+    def axis_motion_done(self, axis: int) -> bool:
+        if axis not in (1, 2):
+            raise ESP300Error(f"Unsupported axis {axis}")
+        raw = self.transport.query(f"{axis}MD?")
+        try:
+            value = int(float(raw))
+        except ValueError as exc:
+            raise ESP300Error(
+                f"Unexpected axis {axis} motion-done response: {raw!r}"
+            ) from exc
+        if value not in (0, 1):
+            raise ESP300Error(
+                f"Unexpected axis {axis} motion-done value: {raw!r}"
+            )
+        return value == 1
 
     def refresh_axis_units(self) -> None:
         for axis in (1, 2):

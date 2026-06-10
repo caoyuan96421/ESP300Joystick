@@ -90,7 +90,7 @@ class ESPWorkerThread(QThread):
                 self._safe_poll_snapshot(timeout_s=0.0, quiet=True)
                 next_poll = time.monotonic() + self._poll_interval_s
 
-        self._close_controller()
+        self._close_controller(force=True)
 
     def stop(self) -> None:
         self._running = False
@@ -156,8 +156,8 @@ class ESPWorkerThread(QThread):
             if name == "connect":
                 self._connect(*command[1:])
             elif name == "disconnect":
-                self._close_controller()
-                self.connected_changed.emit(False, "Disconnected")
+                if self._close_controller(force=False):
+                    self.connected_changed.emit(False, "Disconnected")
             elif name == "poll_interval":
                 self._poll_interval_s = max(0.05, float(command[1]))
             elif name == "poll":
@@ -201,7 +201,8 @@ class ESPWorkerThread(QThread):
         rs232_rtscts: bool,
         gpib_resource: Optional[str],
     ) -> None:
-        self._close_controller()
+        if not self._close_controller(force=False):
+            raise ESP300Error("Existing connection was not safely closed")
         if method == "RS232":
             transport = SerialTransport(
                 rs232_port,
@@ -221,17 +222,27 @@ class ESPWorkerThread(QThread):
         self.max_jog_speed_changed.emit(controller.max_jog_speed_mm_s)
         self._poll_snapshot()
 
-    def _close_controller(self) -> None:
+    def _close_controller(self, force: bool = False) -> bool:
         if not self._controller:
-            return
+            return True
+        controller = self._controller
         try:
-            if self._controller.is_connected:
-                self._controller.stop_all()
-        except Exception:
-            pass
-        self._controller.close()
+            if controller.is_connected:
+                controller.stop_and_wait_until_done()
+        except Exception as exc:
+            self.error_message.emit(f"Safe disconnect failed: {exc}")
+            if not force:
+                return False
+        try:
+            controller.close()
+        except Exception as exc:
+            self.error_message.emit(f"Controller close failed: {exc}")
         self._controller = None
         self._active_velocity_mm_s = {1: 0.0, 2: 0.0}
+        with self._jog_lock:
+            self._pending_jog_normalized = None
+            self._jog_update_queued = False
+        return True
 
     def _require_controller(self) -> ESP300Controller:
         if not self._controller or not self._controller.is_connected:
@@ -1311,7 +1322,7 @@ class MainWindow(QMainWindow):
             self.joystick_manager.close()
         if hasattr(self, "esp_worker"):
             self.esp_worker.stop()
-            self.esp_worker.wait(2000)
+            self.esp_worker.wait(12000)
 
     def __del__(self) -> None:
         try:
